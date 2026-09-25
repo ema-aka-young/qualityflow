@@ -8,5 +8,6 @@ instance:
 # Jira project prefixes that route to this QualityFlow project
 prefixes:
   - "CNV"
+  - "VIRTSTRAT"
 
 pr_url_scan_pattern: "https://github.com/.*/pull/\\d+"

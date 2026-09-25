@@ -6,16 +6,15 @@ routes:
   - project: "cnv"
     jira_prefixes:
       - "CNV"
+      - "VIRTSTRAT"
     github_repos:
       - "kubevirt/kubevirt"
-      - "RedHatQE/openshift-python-wrapper"
+      - "kubevirt/containerized-data-importer"
+      - "kubevirt/kubevirt-velero-plugin"
       - "RedHatQE/openshift-virtualization-tests"
-
-  - project: "example"
-    jira_prefixes:
-      - "MYPROJ"
-    github_repos:
-      - "your-org/your-repo"
+      - "RedHatQE/openshift-python-wrapper"
+      - "kubevirt/kubevirt-migration-operator"
+      - "kubevirt/vm-file-restore-operator"
 
   # Add routes for your project:
   # - project: "my-project"
