@@ -12,6 +12,7 @@ routes:
       - "kubevirt/containerized-data-importer"
       - "kubevirt/kubevirt-velero-plugin"
       - "RedHatQE/openshift-virtualization-tests"
+      - "RedHatQE/openshift-virtualization-tests-design-docs"
       - "RedHatQE/openshift-python-wrapper"
       - "kubevirt/kubevirt-migration-operator"
       - "kubevirt/vm-file-restore-operator"
