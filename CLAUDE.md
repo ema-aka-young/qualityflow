@@ -17,7 +17,9 @@ Requires [uv](https://github.com/astral-sh/uv). No traditional build system — 
 ```bash
 uv run deploy.py --target claude              # Deploy to ~/.claude/
 uv run deploy.py --target cursor              # Deploy to ~/.cursor/
-uv run deploy.py --target both                # Deploy to both
+uv run deploy.py --target codex               # Deploy to ~/.codex/ (agents as TOML, prompts) + ~/.agents/skills/
+uv run deploy.py --target both                # Deploy to claude + cursor
+uv run deploy.py --target all                 # Deploy to claude + cursor + codex
 uv run deploy.py --target both --scope project --project-path /path/to/project
 uv run deploy.py --dry-run --target both      # Preview changes
 uv run deploy.py --target both --validate     # Validate configs before deploying
@@ -66,6 +68,12 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
     re-review of an edited STP
 
 /std-builder {JIRA_ID}
+  → input: the STP, or — when there is none (bug fixes, smaller features,
+    scenarios imported from an external test case management system) — a
+    scenario list at outputs/{JIRA_ID}/input/{JIRA_ID}_scenarios.yaml
+    (format: std-orchestrator Step 1B; validate with
+    `validate_std.py --scenarios`). With a scenario list the stp_review gate
+    and the stp.status prerequisite do not apply.
   → STD YAML (outputs/{JIRA_ID}/std/{JIRA_ID}_test_description.yaml)
   → Test stubs (outputs/{JIRA_ID}/std/{language}-tests/, one dir per tier language)
   → auto-chains /review-std, then /refine-std --address-findings when the
@@ -242,7 +250,11 @@ of tier classification:
 - The **test-strategy-resolver** skill scans the source repository to
   detect language, framework, and conventions
 - Scenarios use descriptive labels ("unit", "functional", "integration",
-  "e2e") instead of tier numbers
+  "e2e") instead of tier numbers — unless `project.yaml` defines
+  `scenario_tiers`, in which case they are labelled `[Tier N]` by
+  tier-classifier (labels only; code generation stays auto). CNV does this:
+  its reviewers require Tier 1/2/3, and Tier 3 stubs/tests carry the `tier3`
+  pytest marker
 - Code generators read framework and imports from `code_generation_config`
   in the STD YAML, not from `tier*.yaml` configs
 - `config_dir: null` is the universal signal to all downstream skills
@@ -308,9 +320,12 @@ package mapping), tests fall back to `outputs/{JIRA_ID}/{language}-tests/`.
 
 ### PSE Format for Test Docstrings
 
-All generated test stubs use Preconditions/Steps/Expected documentation:
+All generated test stubs use Preconditions/Steps/Expected documentation,
+prefixed with the test's own STP reference — or `Jira:` when the STD has no
+STP. It is repeated per test, since tests move between modules:
 
 ```
+STP: https://.../CNV-12345_test_plan.md
 Preconditions: Running VM, network namespace configured
 Steps:
   1. Create network interface spec

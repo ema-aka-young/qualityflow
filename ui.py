@@ -205,14 +205,28 @@ _MD_ALLOWED_ATTRS = {
 }
 
 
+_TASK_ITEM = re.compile(r"<li>(\s*<p>)?\[([ xX])\]\s")
+
+
 def _md_to_html(raw: str) -> str:
-    """Markdown -> sanitized HTML, same allowlist/trust-boundary as get_artifact."""
-    return bleach.clean(
-        markdown.markdown(raw, extensions=["tables", "fenced_code"]),
+    """Markdown -> sanitized HTML, same allowlist/trust-boundary as get_artifact.
+
+    tab_length=2: STPs nest lists with 2-space indents (the CNV template and
+    GitHub both do). Python-Markdown's default of 4 flattened every nested
+    bullet into its parent list, so the dashboard showed a Known Limitation, its
+    detail and its sign-off as three unrelated siblings.
+    Task-list items (`- [x] ...`) become a checkbox glyph; this runs after
+    bleach and only inserts fixed markup, so it adds nothing untrusted."""
+    html = bleach.clean(
+        markdown.markdown(raw, extensions=["tables", "fenced_code"], tab_length=2),
         tags=_MD_ALLOWED_TAGS,
         attributes=_MD_ALLOWED_ATTRS,
         strip=True,
     )
+    return _TASK_ITEM.sub(
+        lambda m: '<li class="task">' + (m.group(1) or "") + '<span class="task-box">'
+        + ("\u2611" if m.group(2) in "xX" else "\u2610") + "</span>",
+        html)
 
 
 def _state_dir(jira_id: str) -> Path:
@@ -350,24 +364,30 @@ if _RUNNER_CURSOR_MODEL_DEFAULT not in _RUNNER_CURSOR_MODELS:
 # Codex runtime. Keep this aligned with the model picker exposed by the Codex
 # CLI. The allowlist remains operator-configurable because model availability
 # can vary by account/project.
+# Default is Sol, not the flagship Astra: Astra is 2.5x Sol's price and each
+# person pays from their own OpenAI budget (a pilot user burned most of a
+# month's budget on Astra-by-default runs, 2026-09). Prices are in the labels
+# so the picker shows what a choice costs — OpenAI standard tier, short
+# context, $ per 1M input / output tokens, checked 2026-09-27; the same table
+# drives cost reporting (pipeline_runner.MODEL_PRICES).
 _CODEX_MODEL_LABELS = {
-    "gpt-6-astra": "GPT-6 Astra (default)",
-    "gpt-5.6-sol": "GPT-5.6 Sol",
-    "gpt-5.6-terra": "GPT-5.6 Terra",
-    "gpt-5.6-luna": "GPT-5.6 Luna",
-    "gpt-5.5": "GPT-5.5",
-    "gpt-5.2": "GPT-5.2",
+    "gpt-6-astra": "GPT-6 Astra · $10 / $50",
+    "gpt-5.6-sol": "GPT-5.6 Sol · $4 / $20",
+    "gpt-5.6-terra": "GPT-5.6 Terra · $2 / $12",
+    "gpt-5.6-luna": "GPT-5.6 Luna · $0.20 / $1.20",
+    "gpt-5.5": "GPT-5.5 · $5 / $30",
+    "gpt-5.2": "GPT-5.2 · $1.75 / $14",
     # Retain the previous entries for existing browser selections and
     # operator-configured deployments.
-    "gpt-5-codex": "GPT-5 Codex (legacy)",
-    "gpt-5": "GPT-5 (legacy)",
-    "gpt-4.1": "GPT-4.1 (legacy)",
+    "gpt-5-codex": "GPT-5 Codex (legacy) · $1.25 / $10",
+    "gpt-5": "GPT-5 (legacy) · $1.25 / $10",
+    "gpt-4.1": "GPT-4.1 (legacy) · $2 / $8",
 }
-_RUNNER_CODEX_MODEL_DEFAULT = os.environ.get("QF_RUNNER_CODEX_MODEL", "gpt-6-astra")
+_RUNNER_CODEX_MODEL_DEFAULT = os.environ.get("QF_RUNNER_CODEX_MODEL", "gpt-5.6-sol")
 _RUNNER_CODEX_MODELS = [m.strip() for m in os.environ.get("QF_RUNNER_CODEX_MODELS", "").split(",") if m.strip()]
 if not _RUNNER_CODEX_MODELS:
     _RUNNER_CODEX_MODELS = [
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
         "gpt-5.5", "gpt-5.2",
         "gpt-5-codex", "gpt-5", "gpt-4.1",
     ]
@@ -1692,7 +1712,7 @@ def _record_phase_result(phases: dict, phase: str, phase_data: dict) -> None:
     completed/failed write (where the placeholder's already-archived history
     must not be dropped just because "in_progress" itself isn't terminal).
     The archived copy is intentionally compact (status/verdict/model/
-    finished_ts/actor only) so history doesn't balloon with every past run's full
+    finished_ts/actor/cost_usd only) so history doesn't balloon with every past run's full
     `output` text.
     """
     prev = phases.get(phase)
@@ -1706,8 +1726,14 @@ def _record_phase_result(phases: dict, phase: str, phase_data: dict) -> None:
     same_run = isinstance(prev, dict) and "finished_ts" not in prev and (
         "started_ts" in prev or prev.get("status") not in _TERMINAL_PHASE_STATUSES)
     if isinstance(prev, dict) and prev.get("status") in _TERMINAL_PHASE_STATUSES and not same_run:
-        history.append({k: prev[k] for k in ("status", "verdict", "model", "finished_ts", "actor", "actor_name")
-                        if k in prev})
+        entry = {k: prev[k] for k in ("status", "verdict", "model", "finished_ts", "actor", "actor_name")
+                 if k in prev}
+        # Keep each earlier run's cost: a re-run (or another Request changes
+        # round) replaces `usage`, and the phase's total spend is the sum.
+        cost = (prev.get("usage") or {}).get("cost_usd")
+        if isinstance(cost, (int, float)):
+            entry["cost_usd"] = cost
+        history.append(entry)
     if history:
         phase_data["history"] = history[-_HISTORY_CAP:]
     # Carry started_ts (and who started the run) across the in_progress ->
@@ -6374,17 +6400,25 @@ def _live_progress(jira_id: str, phase: str) -> dict:
     make this show up in a profile.
     """
     try:
-        from pipeline_runner import progress_path, _parse_stream
-        raw = progress_path(jira_id, phase).read_text(errors="replace")
+        from pipeline_runner import progress_path, _parse_stream, live_usage
+        try:
+            raw = progress_path(jira_id, phase).read_text(errors="replace")
+        except FileNotFoundError:
+            raw = ""
         steps, _, _, model = _parse_stream(raw)
+        live = live_usage(jira_id, phase, raw)
     except Exception:
         return {}
     out: dict = {}
     if steps:
         out["steps"] = steps[-12:]
         out["step_count"] = len(steps)
-    if model:
-        out["model"] = model
+    if model or live.get("model"):
+        out["model"] = model or live.get("model")
+    # Running spend so far (list-price estimate; the recorded cost replaces it
+    # when the phase ends). Absent until the first model call finishes.
+    if live.get("tokens"):
+        out["live_usage"] = {"cost_usd": live.get("cost_usd"), "tokens": live["tokens"]}
     return out
 
 
@@ -6722,7 +6756,7 @@ def _get_target_repo(project_id: str, tier: str = "primary") -> dict:
     if not repos_file.exists():
         return {}
     repos = _read_yaml(repos_file)
-    repo_key = "tier2_repo" if tier == "tier2" else "primary_repo"
+    repo_key = {"tier2": "tier2_repo", "design_docs": "design_docs_repo"}.get(tier, "primary_repo")
     repo = repos.get(repo_key, {})
     if not repo:
         return {}
@@ -6937,6 +6971,37 @@ def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
     return groups
 
 
+_stp_folder_cache: dict[str, tuple[list[str], float]] = {}  # repo → (folders, fetched_ts)
+
+
+@app.get("/api/pipelines/{jira_id}/push-pr/folders")
+def push_pr_folders(jira_id: str):
+    """The design-docs repo's stps/ folders, for Push to PR's folder picker.
+
+    {"repo": null} when the project has no design_docs_repo: Push to PR then
+    keeps its single PR to the primary repo."""
+    if not re.match(r"^[A-Z]+-\d+$", jira_id):
+        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
+    target = _get_target_repo(_infer_project(jira_id), "design_docs")
+    repo = target.get("full_name")
+    if not repo:
+        return {"repo": None, "folders": []}
+    cached = _stp_folder_cache.get(repo)
+    if cached and time.time() - cached[1] < 600:
+        return {"repo": repo, "folders": cached[0]}
+    url = f"https://api.github.com/repos/{repo}/contents/stps?ref={target.get('default_branch', 'main')}"
+    # The repo is public; a pod token not SSO-authorized for its org gets a 403.
+    items = _github_api_get(url)
+    if not isinstance(items, list):
+        items = _github_api_get(url, anonymous=True)
+    if not isinstance(items, list):
+        raise HTTPException(502, f"Could not list stps/ in {repo}")
+    folders = sorted(i["name"] for i in items
+                     if i.get("type") == "dir" and i.get("name") != "stp-template")
+    _stp_folder_cache[repo] = (folders, time.time())
+    return {"repo": repo, "folders": folders}
+
+
 @app.post("/api/pipelines/{jira_id}/push-pr")
 async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(default="")):
     """Push pipeline outputs to the team's GitHub repo and open a PR.
@@ -6951,9 +7016,10 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
     if not re.match(r"^[A-Z]+-\d+$", jira_id):
         raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
 
-    # Check for existing PR
+    # Check for existing PR. A closed one doesn't block a new push: it was
+    # abandoned (e.g. opened against the wrong repo) and the new PR replaces it.
     existing = _read_pr_info(jira_id)
-    if existing and existing.get("url"):
+    if existing and existing.get("url") and existing.get("state") != "closed":
         return {"status": "existing", "pr": existing, "message": "PR already exists for this ticket"}
 
     # Parse optional body
@@ -6986,6 +7052,29 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
 
     # Collect files grouped by tier
     file_groups = _collect_pr_files(jira_id)
+
+    # A project with a design_docs_repo (CNV) keeps STPs there, under
+    # stps/<folder>/: the STP alone goes to that repo, chosen folder, and any
+    # generated tests go to the primary (test) repo as a second PR. STD,
+    # reviews and the intermediate yaml are pushed nowhere.
+    docs_target = _get_target_repo(project_id, "design_docs")
+    tests_target: dict = {}
+    if docs_target.get("full_name"):
+        folder = str(body.get("stp_folder") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", folder):
+            raise HTTPException(400, f"Pick the stps/ folder in {docs_target['full_name']} for this STP.")
+        stp = next((f for f in file_groups["docs"]
+                    if f["path"].endswith(f"/stp/{jira_id}_test_plan.md")), None)
+        if not stp:
+            raise HTTPException(404, f"No STP found for {jira_id}")
+        file_groups = {
+            "primary": [],
+            "docs": [dict(stp, path=f"stps/{folder}/{jira_id}.md")],
+            "tier2": file_groups["primary"] + file_groups["tier2"],
+        }
+        tests_target = target
+        owner_repo = docs_target["full_name"]
+        base_branch = docs_target.get("default_branch", "main")
     all_files = file_groups["primary"] + file_groups["docs"]
 
     # tier2 (Python) files go to a separate tier2 repo only when one is actually
@@ -6993,7 +7082,7 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
     # primary push — previously they were silently DROPPED here for
     # Python-primary projects (no tier2_repo configured): collected, credited in
     # the metrics, and never committed anywhere.
-    tier2_target = _get_target_repo(project_id, "tier2")
+    tier2_target = tests_target or _get_target_repo(project_id, "tier2")
     tier2_pr_info = None
     tier2_separate = bool(
         file_groups["tier2"]
@@ -7050,13 +7139,13 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
 
         # --- Push to primary repo (Go tests + docs) ---
         if all_files:
-            title = f"[QualityFlow] Test artifacts for {jira_id}"
+            title = f"[QualityFlow] {'STP' if tests_target else 'Test artifacts'} for {jira_id}"
             pr_body = (
                 f"## QualityFlow Pipeline Outputs\n\n"
                 f"**Ticket:** [{jira_id}]({_jira_base_url(project_id)}/browse/{jira_id})\n"
                 f"**Project:** {project_id}\n"
                 f"**Files:** {len(all_files)}\n\n"
-                f"### Test Files\n"
+                f"### Files\n"
                 + "\n".join(f"- `{f['path']}`" for f in all_files)
                 + "\n\n---\n*Auto-generated by QualityFlow*"
             )
@@ -7067,7 +7156,7 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
             tier2_repo = tier2_target["full_name"]
             tier2_base = tier2_target.get("default_branch", "main")
 
-            title = f"[QualityFlow] Tier 2 tests for {jira_id}"
+            title = f"[QualityFlow] {'Tests' if tests_target else 'Tier 2 tests'} for {jira_id}"
             pr_body = (
                 f"## QualityFlow Tier 2 Tests\n\n"
                 f"**Ticket:** [{jira_id}]({_jira_base_url(project_id)}/browse/{jira_id})\n"
@@ -10423,9 +10512,10 @@ def _test_cov_project_dir(project_id: str) -> Path:
 
 # --- GitHub API helpers for merge-base and patch coverage ---
 
-def _github_api_get(url: str, token: str = "") -> dict | None:
-    """GET a GitHub API URL. Returns parsed JSON or None on failure."""
-    if not token:
+def _github_api_get(url: str, token: str = "", anonymous: bool = False) -> dict | None:
+    """GET a GitHub API URL. Returns parsed JSON or None on failure.
+    anonymous: skip the env token (public data, when that token is refused)."""
+    if not token and not anonymous:
         token = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     headers = {"Accept": "application/vnd.github+json"}
     if token:

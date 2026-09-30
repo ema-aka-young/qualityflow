@@ -41,9 +41,16 @@ SECTIONS = [
     ("section_iii_1", "requirements-to-tests mapping"),
     ("section_iv", "sign-off and approval"),
 ]
+# QF's bundled template has a "1. Requirements-to-Tests Mapping" subheading; the
+# CNV design-docs template puts the mapping straight under Section III.
+OPTIONAL_SECTIONS = {"section_iii_1"}
 
 II2_CATEGORIES = [("Functional", 4), ("Non-Functional", 5),
-                  ("Integration & Compatibility", 3), ("Infrastructure", 1)]
+                  ("Integration & Compatibility", 4), ("Infrastructure", 1)]
+II2_TOTAL = sum(n for _, n in II2_CATEGORIES)
+
+RISK_CATEGORIES = ["Timeline/Schedule", "Test Coverage", "Test Environment",
+                   "Untestable Aspects", "Resource Constraints", "Dependencies"]
 
 GENERIC_SCENARIOS = [
     "Verify automated tests pass in CI",
@@ -61,6 +68,17 @@ REQ_ENTRY = re.compile(r"^- \*\*\[([^\]]+)\]\*\*\s*(?:--|—|-)?\s*(.*)")
 IP_RE = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 OLD_NUMBERING = re.compile(r"\bII\.(4\.[A-D]|[678])\b")
+TOP_ITEM = re.compile(r"^- ")
+SIGN_OFF = re.compile(r"\*Sign-off:\*")
+# A human-only field filled with status prose instead of the template's
+# [Name/Date] placeholder (pilot feedback: the placeholders went missing).
+STATUS_PROSE = re.compile(
+    r"\*(?:Sign-off|PM/Lead Agreement):\*\s*(?:pending|tbd|not recorded|not yet|"
+    r"n/?a\b|none\b|stated in|awaiting)", re.I)
+SCENARIO_LINE = re.compile(r"^\s*- \*Test Scenario:\*(.*)")
+SCENARIO_ID = re.compile(r"\*\*TS-(\d+)\*\*")
+CLASS_TAG = re.compile(r"\[(?:Tier [123]|unit|functional|integration|e2e)\]", re.I)
+MATURITY = re.compile(r"^\s+- (DP|TP|GA):\s*(.*)$")
 
 NFR_KEYWORDS = {
     "Security Testing": ["security", "rbac", "auth", "injection", "permission",
@@ -153,7 +171,9 @@ def validate(text, stp_header=None):
               "Engineering Plan**'" % title)
 
     secs = split_sections(lines)
-    missing = [needle for key, needle in SECTIONS if key not in secs]
+    iii_key = "section_iii_1" if "section_iii_1" in secs else "section_iii"
+    missing = [needle for key, needle in SECTIONS
+               if key not in secs and key not in OPTIONAL_SECTIONS]
     rep.check("structure.all_sections_present", not missing,
               "Missing/out-of-order sections: %s" % ", ".join(missing))
 
@@ -164,9 +184,9 @@ def validate(text, stp_header=None):
 
     rep.check("structure.horizontal_rules",
               hr_between("feature_overview", "section_i")
-              and hr_between("section_i_3", "section_ii")
-              and hr_between("section_iii_1", "section_iv"),
-              "Missing '---' rule after Feature Overview, after Section I.3, "
+              and hr_between("section_ii_5", "section_iii")
+              and hr_between(iii_key, "section_iv"),
+              "Missing '---' rule after Feature Overview, before Section III, "
               "or before Section IV")
 
     # --- list-item counts --------------------------------------------------
@@ -179,22 +199,96 @@ def validate(text, stp_header=None):
         rep.check(name, ok, "%s: found %d items, expected %s%d"
                   % (name, n, "at least " if at_least else "", expected))
 
-    count_check("list_items.metadata", "metadata", BOLD_BULLET, 6)
+    # Metadata fields end where Document Conventions begins (its terms are
+    # bold bullets too).
+    if "metadata" in secs:
+        body = secs["metadata"][1]
+        cut = next((i for i, ln in enumerate(body) if "document conventions" in ln.lower()),
+                   len(body))
+        fields = [ln for ln in body[:cut] if re.match(r"^- \*\*", ln)]
+        rep.check("list_items.metadata", len(fields) >= 7,
+                  "list_items.metadata: found %d top-level fields, expected at least 7 "
+                  "(Enhancement, Feature Tracking, Epic Tracking, Feature Maturity, QE "
+                  "Owner, Owning SIG, Participating SIGs)" % len(fields))
+        fm = next((i for i, ln in enumerate(body[:cut])
+                   if re.match(r"^- \*\*Feature Maturity:?\*\*", ln)), None)
+        phases, bad = {}, []
+        if fm is not None:
+            for ln in body[fm + 1:cut]:
+                m = MATURITY.match(ln)
+                if not m:
+                    if TOP_ITEM.match(ln):
+                        break
+                    continue
+                phases[m.group(1)] = m.group(2).strip()
+            bad = [k for k, v in phases.items()
+                   if len(v) > 40 or re.search(r"[.;] \w", v) or not v]
+        rep.check("content.feature_maturity",
+                  fm is not None and set(phases) == {"DP", "TP", "GA"} and not bad,
+                  "Feature Maturity must be a top-level metadata field with exactly DP/TP/GA "
+                  "sub-items, each a version, N/A or '<value> [confirm]' — found %s%s"
+                  % (sorted(phases) if fm is not None else "no Feature Maturity field",
+                     ("; prose in " + ", ".join(bad)) if bad else ""))
+    else:
+        rep.check("list_items.metadata", False, "Metadata section not found")
     count_check("list_items.section_i_1", "section_i_1", CHECKBOX, 5)
     count_check("list_items.section_i_3", "section_i_3", CHECKBOX, 5)
     count_check("list_items.section_ii_3", "section_ii_3", BOLD_BULLET, 10)
 
-    # II.1 Out of Scope: >=1 checkbox after the "Out of Scope" marker
+    def items(body):
+        """Top-level list items as (first line, [lines until the next one])."""
+        out = []
+        for i, ln in enumerate(body):
+            if TOP_ITEM.match(ln):
+                block = []
+                for nxt in body[i + 1:]:
+                    if TOP_ITEM.match(nxt) or (nxt.strip() and not nxt.startswith((" ", "\t"))):
+                        break
+                    block.append(nxt)
+                out.append((ln, block))
+        return out
+
+    def is_none(body):
+        return any(ln.strip().lower().startswith("none") for ln in body)
+
+    # II.1 Out of Scope and Test Limitations
     if "section_ii_1" in secs:
         body = secs["section_ii_1"][1]
-        idx = next((i for i, ln in enumerate(body)
-                    if "out of scope" in ln.lower()), None)
-        n = count_between(body[idx + 1:], CHECKBOX) if idx is not None else 0
-        rep.check("list_items.section_ii_1_out_of_scope", n >= 1,
-                  "Out of Scope: found %d checkbox items, expected at least 1" % n)
+        low = [ln.lower() for ln in body]
+        oos = next((i for i, ln in enumerate(low) if "out of scope" in ln), None)
+        tl = next((i for i, ln in enumerate(low)
+                   if i > (oos or 0) and "test limitations" in ln), None)
+        oos_body = body[oos + 1:tl] if oos is not None else []
+        oos_items = items(oos_body)
+        rep.check("list_items.section_ii_1_out_of_scope", bool(oos_items) or is_none(oos_body),
+                  "Out of Scope: no items and no 'None' statement")
+        missing = [ln.strip() for ln, blk in oos_items
+                   if not any("*Rationale:*" in x for x in blk)
+                   or not any("*PM/Lead Agreement:*" in x for x in blk)]
+        rep.check("content.out_of_scope_fields", not missing,
+                  "Out of Scope items missing *Rationale:* / *PM/Lead Agreement:*: %s"
+                  % "; ".join(missing))
+        rep.check("structure.test_limitations", tl is not None,
+                  "Section II.1 has no 'Test Limitations' block")
+        tl_body = body[tl + 1:] if tl is not None else []
+        unsigned = [ln.strip() for ln, blk in items(tl_body)
+                    if not any(SIGN_OFF.search(x) for x in [ln] + blk)]
+        rep.check("content.test_limitation_sign_offs", not unsigned,
+                  "Test Limitations without a *Sign-off:* line: %s" % "; ".join(unsigned))
     else:
         rep.check("list_items.section_ii_1_out_of_scope", False,
                   "Section II.1 not found")
+
+    # I.2 Known Limitations: every limitation carries its sign-off line
+    if "section_i_2" in secs:
+        body = secs["section_i_2"][1]
+        lims = items(body)
+        unsigned = [ln.strip() for ln, blk in lims
+                    if not any(SIGN_OFF.search(x) for x in [ln] + blk)]
+        rep.check("content.known_limitation_sign_offs",
+                  (bool(lims) or is_none(body)) and not unsigned,
+                  "Known Limitations without a *Sign-off:* line: %s"
+                  % ("; ".join(unsigned) or "no items and no 'None' statement"))
 
     # II.2 categories
     if "section_ii_2" in secs:
@@ -217,42 +311,40 @@ def validate(text, stp_header=None):
                 problems.append("category '%s' has %d items, expected %d"
                                 % (cat, counts[cat], want))
         total = sum(counts.values())
-        if total != 13:
-            problems.append("total %d checkbox items, expected 13" % total)
+        if total != II2_TOTAL:
+            problems.append("total %d checkbox items, expected %d" % (total, II2_TOTAL))
         rep.check("list_items.section_ii_2", not problems,
                   "Section II.2: " + "; ".join(problems))
     else:
         rep.check("list_items.section_ii_2", False, "Section II.2 not found")
 
-    # II.5: 7 top-level checkbox categories
+    # II.5: the six risk categories as bold labels; a stated risk carries a
+    # mitigation and a sign-off, a category with no risk still says why.
     if "section_ii_5" in secs:
         body = secs["section_ii_5"][1]
-        top = [ln for ln in body if re.match(r"^- \[[ xX]\]", ln)]
-        rep.check("list_items.section_ii_5", len(top) == 7,
-                  "Section II.5: found %d risk categories, expected 7" % len(top))
-        # checked categories need >= 3 indented sub-items (warning only)
+        labels = {}
         for i, ln in enumerate(body):
-            if not re.match(r"^- \[[xX]\]", ln):
-                continue
-            subs = 0
-            for nxt in body[i + 1:]:
-                if re.match(r"^\s+- ", nxt) or re.match(r"^\s+\* ", nxt):
-                    subs += 1
-                elif nxt.strip() and not nxt.startswith((" ", "\t")):
-                    break
-            if subs < 3:
-                rep.check("content.risk_sub_items", False,
-                          "Risk category %r has %d sub-items, expected 3 "
-                          "(Risk, Mitigation, Impact/Status)" % (ln.strip(), subs),
-                          warn_only=True)
-        rep.check("content.risk_sub_items", True)
+            plain = ln.strip().strip("*").strip().rstrip(":")
+            if plain in RISK_CATEGORIES + ["Other"] and ln.strip().startswith("**"):
+                labels[plain] = i
+        order = sorted(labels.items(), key=lambda kv: kv[1])
+        problems = ["category '%s' missing" % c for c in RISK_CATEGORIES if c not in labels]
+        for n, (cat, i) in enumerate(order):
+            end = order[n + 1][1] if n + 1 < len(order) else len(body)
+            blk = "\n".join(body[i + 1:end])
+            if "Mitigation:" not in blk:
+                problems.append("'%s' has no Mitigation" % cat)
+            if "**Risk:**" in blk and not SIGN_OFF.search(blk):
+                problems.append("'%s' states a risk without a *Sign-off:* line" % cat)
+        rep.check("list_items.section_ii_5", not problems,
+                  "Section II.5: " + "; ".join(problems))
     else:
         rep.check("list_items.section_ii_5", False, "Section II.5 not found")
 
     # --- Section III.1 -----------------------------------------------------
     entries = []
-    if "section_iii_1" in secs:
-        i0, body = secs["section_iii_1"]
+    if iii_key in secs:
+        i0, body = secs[iii_key]
         for i, ln in enumerate(body):
             m = REQ_ENTRY.match(ln)
             if not m:
@@ -264,6 +356,37 @@ def validate(text, stp_header=None):
                 block.append(nxt)
             entries.append((m.group(1), m.group(2).strip(), block))
         rep.check("list_items.section_iii", True)  # no minimum enforced
+
+        # The table layout the design-docs rules also accept. A blank
+        # Requirement ID cell continues the requirement above.
+        table_bad, cols, current = [], None, None
+        for ln in body:
+            if not ln.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+            low = [c.lower() for c in cells]
+            if cols is None:
+                if any("requirement id" in c for c in low) and any("test scenario" in c for c in low):
+                    cols = {k: next((i for i, c in enumerate(low) if k in c), None)
+                            for k in ("requirement id", "requirement summary",
+                                      "test scenario", "tier", "priority")}
+                continue
+            if all(set(c) <= set(":- ") for c in cells):
+                continue
+            get = lambda k: cells[cols[k]] if cols[k] is not None and cols[k] < len(cells) else ""  # noqa: E731
+            if get("requirement id"):
+                current = get("requirement id")
+                entries.append((current, get("requirement summary"), []))
+            if current is None or not all(get(k) for k in ("test scenario", "tier", "priority")
+                                          if cols[k] is not None):
+                table_bad.append(current or "(row without a requirement)")
+            elif entries:
+                entries[-1][2].append("*Test Scenario:* %s *Priority:* %s"
+                                      % (get("test scenario"), get("priority")))
+        if cols is not None:
+            rep.check("content.section_iii_1_format", not table_bad,
+                      "Table rows missing a scenario, tier or priority: %s"
+                      % ", ".join(dict.fromkeys(table_bad)))
 
         bad_fmt = [jid for jid, _, block in entries
                    if not any("*Test Scenario:*" in b for b in block)
@@ -284,6 +407,32 @@ def validate(text, stp_header=None):
         rep.check("content.valid_test_tiers", not bad_tiers,
                   "Invalid tier references in Section III.1 (use inline "
                   "[Tier 1]/[Tier 2]): %s" % ", ".join(sorted(set(bad_tiers))))
+
+        # Each scenario: its classification tag inline (std-orchestrator parses
+        # it from this line) and a TS id that is unique and in document order.
+        ids, untagged = [], []
+        for i, ln in enumerate(body):
+            m = SCENARIO_LINE.match(ln)
+            if not m:
+                continue
+            scen = m.group(1)
+            for nxt in body[i + 1:]:  # a wrapped scenario line continues it
+                if re.match(r"^\s*- ", nxt) or not nxt.strip():
+                    break
+                scen += " " + nxt.strip()
+            if not CLASS_TAG.search(scen):
+                untagged.append(scen.strip()[:60])
+            ids += [int(x) for x in SCENARIO_ID.findall(scen)]
+        rep.check("content.scenario_classification_inline", not untagged,
+                  "Scenarios without an inline [Tier N] / test-type tag (a separate "
+                  "*Test Type:* line is not parsed): %s" % "; ".join(untagged[:5]))
+        dup_ids = sorted({x for x in ids if ids.count(x) > 1})
+        rep.check("content.scenario_ids_unique", not dup_ids,
+                  "Duplicate scenario ids: %s" % ", ".join("TS-%02d" % x for x in dup_ids))
+        rep.check("content.scenario_ids_sequential", ids == sorted(ids),
+                  "Scenario ids are not in document order (renumber while no STD "
+                  "exists): %s" % ", ".join("TS-%02d" % x for x in ids[:12]),
+                  warn_only=True)
     else:
         rep.check("list_items.section_iii", False, "Section III.1 not found")
 
@@ -345,6 +494,11 @@ def validate(text, stp_header=None):
               "Non-example email addresses present: %s"
               % ", ".join(sorted(set(bad_emails))))
 
+    prose = sorted({m.group(0) for m in STATUS_PROSE.finditer(text)})
+    rep.check("prohibited.status_prose_in_sign_offs", not prose,
+              "Human-only fields filled with status text instead of the [Name/Date] "
+              "placeholder: %s" % "; ".join(prose))
+
     rep.check("prohibited.current_status_field",
               not re.search(r"^\s*- \*\*Current Status", text, re.M),
               "Removed 'Current Status' metadata field is present")
@@ -387,10 +541,25 @@ def _fixture():
     def boxes(n, label="Item"):
         return "\n".join("- [x] **%s %d:** covered" % (label, i + 1)
                          for i in range(n))
+    risks = "\n".join("**%s**\n\n- **Mitigation:** No risk identified — covered by II.3."
+                      % c for c in RISK_CATEGORIES[1:])
     return """# Test Docs
 ## **PCI Topology - Quality Engineering Plan**
 ### **Metadata & Tracking**
-""" + "\n".join("- **Field %d:** value" % i for i in range(6)) + """
+- **Enhancement(s):** VEP 1
+- **Feature Tracking:** PROJ-1
+- **Epic Tracking:** PROJ-2
+- **Feature Maturity:**
+  - DP: N/A
+  - TP: N/A
+  - GA: v5.1.0 [confirm]
+- **QE Owner(s):** [Name]
+- **Owning SIG:** sig-network
+- **Participating SIGs:** None
+
+**Document Conventions (if applicable):**
+
+- **PCI:** device topology term
 ### **Feature Overview**
 Some overview text.
 ---
@@ -398,15 +567,23 @@ Some overview text.
 ### Section I.1 - Requirement & User Story Review Checklist
 """ + boxes(5) + """
 ### Section I.2 - Known Limitations
-- None known.
+- **IPv6 is not supported**
+  - Upstream non-goal
+  - *Sign-off:* [Name/Date]
 ### Section I.3 - Technology and Design Review
 """ + boxes(5) + """
----
 ## II. Software Test Plan (STP)
 ### Section II.1 - Scope of Testing
-- [x] **Goal:** verify topology stability
+- **[P0]** As an admin, verify topology stability
 **Out of Scope**
-- [ ] **Hardware bring-up**
+- **Hardware bring-up**
+  - *Rationale:* Owned by the hardware team
+  - *PM/Lead Agreement:* [Name/Date]
+
+**Test Limitations**
+
+- **No SR-IOV NICs in the lab**
+  - *Sign-off:* [Name/Date]
 ### Section II.2 - Test Strategy
 **Functional**
 """ + boxes(4) + """
@@ -417,7 +594,7 @@ Some overview text.
 - [ ] **Usability:** n/a
 - [x] **Monitoring:** metrics
 **Integration & Compatibility**
-""" + boxes(3) + """
+""" + boxes(4) + """
 **Infrastructure**
 """ + boxes(1) + """
 ### Section II.3 - Test Environment
@@ -427,20 +604,24 @@ Some overview text.
 ### Section II.4 - Entry Criteria
 - Build available
 ### Section II.5 - Risks
-- [x] **Risk A**
-  - Risk: something
-  - Mitigation: something
-  - Impact: low
-""" + "\n".join("- [ ] **Risk %s**" % c for c in "BCDEFG") + """
+**Timeline/Schedule**
+
+- **Risk:** build may slip
+  - **Mitigation:** prioritize P0
+  - *Estimated impact on schedule:* 2 weeks
+  - *Sign-off:* [Name/Date]
+
+""" + risks + """
+---
 ## III. Test Scenarios & Traceability
 ### Section III.1 - Requirements-to-Tests Mapping
 - **[PROJ-1]** -- As a user I want stable PCI topology
-  - *Test Scenario:* Verify performance latency and security RBAC under
+  - *Test Scenario:* **TS-01**: Verify performance latency and security RBAC under
     concurrent monitoring metric scale load during upgrade migration [Tier 1]
-  - *Priority:* P1
+    - *Priority:* P1
 - **[PROJ-2]** -- As an admin I want alerts on failure
-  - *Test Scenario:* Verify alert fires on induced failure [Tier 2]
-  - *Priority:* P2
+  - *Test Scenario:* **TS-02**: [Tier 2] Verify alert fires on induced failure
+    - *Priority:* P2
 ---
 ## Section IV - Sign-off and Approval
 - **Reviewer:** [Name / @github-username]
@@ -452,6 +633,7 @@ def self_test():
     rep = validate(good)
     fails = {k: v for k, v in rep.checks.items() if v == "fail"}
     assert not fails, "clean fixture should pass, got: %s / %s" % (fails, rep.errors)
+    assert not rep.warnings, rep.warnings
 
     bad = good.replace("Some overview text.",
                        "Some overview text.\n```bash\nls\n```\n"
@@ -460,12 +642,56 @@ def self_test():
     rep = validate(bad)
     for name in ["content.no_code_blocks", "prohibited.real_ips",
                  "prohibited.real_emails", "prohibited.decision_blocks",
-                 "content.valid_test_tiers"]:
+                 "content.valid_test_tiers", "content.scenario_classification_inline"]:
         assert rep.checks[name] == "fail", "%s should fail: %s" % (name, rep.checks)
 
     # section removal detected
     rep = validate(good.replace("### Section II.4 - Entry Criteria", "### skipped"))
     assert rep.checks["structure.all_sections_present"] == "fail"
+
+    # The pilot-feedback regressions, one by one.
+    cases = {
+        # Feature Maturity nested / explained in prose
+        "content.feature_maturity": good.replace(
+            "  - GA: v5.1.0 [confirm]",
+            "  - GA: TBD — the general GA label does not establish offline GA."),
+        # a sign-off placeholder replaced by status text
+        "prohibited.status_prose_in_sign_offs": good.replace(
+            "  - *PM/Lead Agreement:* [Name/Date]", "  - *PM/Lead Agreement:* Pending."),
+        "content.known_limitation_sign_offs": good.replace(
+            "  - Upstream non-goal\n  - *Sign-off:* [Name/Date]", "  - Upstream non-goal"),
+        "content.test_limitation_sign_offs": good.replace(
+            "- **No SR-IOV NICs in the lab**\n  - *Sign-off:* [Name/Date]",
+            "- **No SR-IOV NICs in the lab**"),
+        "structure.test_limitations": good.replace("**Test Limitations**", ""),
+        "content.out_of_scope_fields": good.replace(
+            "  - *Rationale:* Owned by the hardware team\n", ""),
+        "list_items.section_ii_5": good.replace("  - *Sign-off:* [Name/Date]\n\n**Test", "\n**Test"),
+        "list_items.section_ii_2": good.replace("- [x] **Scale Testing:** concurrent ops\n", ""),
+        "content.scenario_ids_unique": good.replace("**TS-02**", "**TS-01**"),
+    }
+    for name, doc in cases.items():
+        rep = validate(doc)
+        assert rep.checks.get(name) == "fail", "%s should fail: %s" % (name, rep.errors)
+    rep = validate(good.replace("**TS-01**", "**TS-09**"))
+    assert rep.checks["content.scenario_ids_sequential"] == "warn"
+
+    # The CNV design-docs layout: no mapping subheading, scenarios in a table
+    # whose blank Requirement ID cells continue the row above.
+    head, _, tail = good.partition("### Section III.1 - Requirements-to-Tests Mapping\n")
+    table = ("| Requirement ID | Requirement Summary | Test Scenario(s) | Tier | Priority |\n"
+             "|:--|:--|:--|:--|:--|\n"
+             "| PROJ-1 | As a user I want stable PCI topology | Verify latency under load | 1 | P1 |\n"
+             "| | | Verify RBAC blocks a non-admin | 2 | P2 |\n")
+    cnv = head + table + tail[tail.index("---"):]
+    rep = validate(cnv)
+    fails = {k: v for k, v in rep.checks.items() if v == "fail"}
+    assert not fails, "CNV layout should pass: %s / %s" % (fails, rep.errors)
+    rep = validate(cnv.replace("| 2 | P2 |", "| 2 | |"))
+    assert rep.checks["content.section_iii_1_format"] == "fail"
+    # the rule sits before Section III, not before Section II
+    rep = validate(good.replace("---\n## III.", "## III."))
+    assert rep.checks["structure.horizontal_rules"] == "fail"
     print("self-test: OK")
 
 

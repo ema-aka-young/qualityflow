@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv run deploy.py --dry-run --target both
+      - run: uv run deploy.py --dry-run --target all
 
   python-checks:
     name: Python self-checks
@@ -51,6 +51,15 @@ jobs:
       # is the stdin filter mode, which exits 0 on empty CI stdin without
       # checking anything.
       - run: uv run --with pyyaml skills/pii-sanitizer/sanitize.py --self-test
+      # Same for the STP structure validator: it is what enforces the template
+      # (sign-off lines, Feature Maturity, Test Limitations, scenario ids), and
+      # its self-test carries one failing case per rule.
+      - run: uv run --with pyyaml skills/output-validator/validate_doc.py --self-test
+      # Pins the STD mechanical validator: counts, STP<->STD traceability by set
+      # difference, and per-stub id/PSE/STP-reference checks. These used to be
+      # LLM judgment calls in the std-reviewer prompt and came out differently
+      # run to run.
+      - run: uv run --with pyyaml skills/std-reviewer/validate_std.py --self-test
       # Cheap syntax gate for the big dashboard + tooling scripts — an ast.parse
       # catches syntax breakage without importing (no deps needed).
       - name: Syntax-check ui.py / deploy.py / onboard.py

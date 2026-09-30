@@ -24,9 +24,21 @@ Coordinates the Software Test Description (STD) generation workflow by:
 
 ## Input Required
 
+**One of two sources** — an STP, or a scenario list:
+
 - `stp_file_path`: Path to the STP markdown file (e.g., `outputs/PROJ-66855/stp/PROJ-66855_test_plan.md`)
+- `scenario_list_path`: Path to a scenario list YAML (e.g.,
+  `outputs/PROJ-66855/input/PROJ-66855_scenarios.yaml`) — used when there is no
+  STP: bug fixes, smaller features, and scenarios imported from an external test
+  case management system. See **Step 1B**.
+
+Plus:
+
 - `jira_id`: The Jira ticket ID (e.g., "PROJ-66855")
 - `output_dir`: Base directory for outputs (defaults to `outputs/{JIRA_ID}/std/`)
+
+When both are present the STP wins and the scenario list is ignored — say so in
+the summary report rather than silently picking one.
 
 ---
 
@@ -36,7 +48,13 @@ Execute the following steps in order:
 
 ---
 
-### Step 1: Parse STP Section III
+### Step 1: Load Scenarios
+
+Scenarios come from the STP when there is one (**Step 1A**) and from a scenario
+list file when there is not (**Step 1B**). Both produce the same `scenarios`
+structure, and everything downstream is identical.
+
+### Step 1A: Parse STP Section III
 
 **Read the STP file and extract all test scenarios from Section III (Test Scenarios & Traceability).**
 
@@ -52,13 +70,27 @@ Execute the following steps in order:
   - *Priority:* P0
 ```
 
+**Also accepted — the table layout** hand-written CNV STPs use (the design-docs
+review rules allow it). A blank Requirement ID cell continues the requirement
+above; each row is one scenario, its Tier column the classification:
+
+```markdown
+| Requirement ID | Requirement Summary | Test Scenario(s) | Tier | Priority |
+|:---------------|:--------------------|:-----------------|:-----|:---------|
+| CNV-96511 | As a backup provider, I want ... | Perform a full backup of a stopped VM in push mode; ... | 1 | P0 |
+| | | Run a full push backup, modify disk data, then an incremental push backup; ... | 1 | P0 |
+```
+
 **Parse and extract:**
 
-- Requirement ID (Jira key from `**[ID]**`)
+- Requirement ID (Jira key from `**[ID]**`, or the table's Requirement ID cell)
 - Requirement summary (text after `—`)
 - Test type classification from test scenario:
   - Tier mode: `[Tier 1]`, `[Tier 2]`
-  - Auto mode: `[unit]`, `[functional]`, `[integration]`, `[e2e]`
+  - Auto mode: `[unit]`, `[functional]`, `[integration]`, `[e2e]` — or `[Tier N]`
+    when the project defines `scenario_tiers`; store it as `tier` (plus the
+    tier's `marker`, if any, from `project_context.scenario_tiers`), and keep
+    auto mode's detected `code_generation_config` for everything else
 - Priority (P0, P1, P2)
 - Scenario description (from `*Test Scenario:*` line)
 - Coverage status (if present): `[EXISTING_COVERAGE]`, `[PARTIAL_COVERAGE]`
@@ -68,8 +100,9 @@ Execute the following steps in order:
 ```yaml
 scenarios:
   - scenario_id: 1
-    tier: "Tier 1"                # tier mode
-    test_type: "functional"       # auto mode (one or the other)
+    tier: "Tier 1"                # tier mode, or auto mode with scenario_tiers
+    test_type: "functional"       # auto mode without scenario_tiers (one or the other)
+    marker: "tier3"               # optional — from scenario_tiers, e.g. CNV Tier 3
     priority: "P0"
     description: "Verify basic reset operation succeeds"
     coverage_status: "NEW"        # optional, defaults to NEW
@@ -85,11 +118,70 @@ scenarios:
 
 ---
 
+### Step 1B: Read a Scenario List
+
+When there is no STP, the scenarios are handed to the pipeline directly. This is
+the seam for inputs other than an STP — an importer for an external test case
+management system writes this file and the rest of the pipeline is unchanged.
+
+**Format** (`outputs/{JIRA_ID}/input/{JIRA_ID}_scenarios.yaml`):
+
+```yaml
+source: "polarion"                  # free text — where these scenarios came from
+context:
+  jira_id: "PROJ-12345"
+  title: "Short feature or bug title"
+  feature_description: "What the change does, in user terms."
+  jira_url: "https://jira.example.com/browse/PROJ-12345"
+  known_limitations: []             # optional
+scenarios:
+  - scenario_id: 1
+    external_id: "TC-4471"          # optional — the id in the source system
+    requirement_id: "PROJ-12345"    # the Jira requirement this covers
+    requirement_summary: "As a user, I want ..."
+    test_type: "functional"         # auto mode; or tier: "Tier 1" in tier mode
+    priority: "P0"
+    description: "Verify basic reset operation succeeds"
+    coverage_status: "NEW"          # optional, defaults to NEW
+    preconditions: []               # optional — carried from the source system
+    steps: []                       # optional
+    expected: []                    # optional
+```
+
+**Validate it before use** (never hand-check these):
+
+```bash
+python3 skills/std-reviewer/validate_std.py --scenarios \
+  outputs/{JIRA_ID}/input/{JIRA_ID}_scenarios.yaml
+```
+
+Exit code 1 means the file is unusable — report the errors and exit rather than
+generating an STD from a malformed list.
+
+**Rules:**
+
+- `preconditions` / `steps` / `expected`, when present, are the source system's
+  own wording. Pass them to std-generator as the basis for the PSE content —
+  **do not invent replacements**; refine wording only, never the meaning. When
+  absent, std-generator derives PSE from `description` as it does for an STP.
+- `external_id` is carried into the STD scenario unchanged, so a migrated test
+  can be traced back to its source record. It does not by itself produce any
+  marker in the stubs — that stays governed by the project's `polarion` toggle.
+- `context.jira_url` becomes the per-test reference in the stubs (`Jira:`),
+  since there is no STP to link. See **stub-generator**.
+
+---
+
 ### Step 2: Generate Comprehensive STD YAML (Single File)
 
 **Generate ONE comprehensive STD file for ALL scenarios:**
 
-1. **Extract STP context** (needed by std-generator):
+1. **Extract STP context** (needed by std-generator).
+   **From a scenario list (Step 1B):** take `context.*` as-is — `jira_id`,
+   `title`, `feature_description`, `known_limitations` (default `[]`) — set
+   `source_constants: []`, `api_extensions: false`, and `stp_reference: null`,
+   then skip to sub-step 2. Steps 1.5 and 1.7 below read the STP and do not
+   apply. **From an STP:**
    - Jira issue metadata (from Metadata & Tracking)
    - Feature description (from Feature Overview)
    - Known limitations (from Section I.2)
@@ -124,13 +216,19 @@ scenarios:
   2. If the STP metadata contains a PR URL, check if it has been merged (via
      GitHub MCP `get_pull_request`). If merged, convert the PR URL to a blob URL
      on the default branch.
-  3. If a `design_docs_repo` is configured in `repositories.yaml`, construct the
-     expected URL
+  3. If a `design_docs_repo` is configured in `repositories.yaml`, search it for
+     an STP that names this ticket (`mcp__github__search_code`,
+     query `{JIRA_ID} repo:{org}/{name}`) and use the blob URL only when exactly
+     one `.md` file matches. Never construct a path you have not seen — design-docs
+     file names are free-form (`cbt.md`), so a guessed URL is a dead link in
+     every stub.
   4. If none found, set `stp_reference.url` to null — stub-generator will fall
      back to the local file path.
 
 2. **Call std-generator skill** with scenarios, STP context,
    `source_constants` array (from Step 1.5, may be empty), `stp_reference` (from Step 1.7), and STP file path.
+   From a scenario list: the same call with `stp_reference: null`, `source_constants: []`,
+   and the scenario list path in place of the STP file path.
 
    **Small tickets (≤15 scenarios):** Generate all scenarios in a single
    Write call (existing behavior).
@@ -270,6 +368,10 @@ This orchestrator calls 1 specialized skill:
   - Suggest: Check STP format, ensure Section III exists
   - Exit with status: error
 
+- **If the scenario list is invalid** (validate_std.py --scenarios exits 1):
+  - Log error: "Scenario list is invalid" and relay every reported error
+  - Exit with status: error — do not generate an STD from a malformed list
+
 - **If std-generator fails for a scenario:**
   - Log warning: "STD generation failed for scenario {num}"
   - Continue with other scenarios
@@ -286,7 +388,7 @@ This orchestrator calls 1 specialized skill:
 
 The orchestration is complete when:
 
-- ✅ All scenarios from STP Section III extracted
+- ✅ All scenarios extracted (STP Section III, or the scenario list)
 - ✅ Comprehensive STD YAML file created
 - ✅ Valid YAML syntax
 - ✅ All required sections populated

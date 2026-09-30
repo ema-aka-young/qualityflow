@@ -148,6 +148,32 @@ versioning:
   current_version: "1.0"
 ```
 
+**stp_document** -- The first line of every generated STP (default `Test Plan`);
+set it to your template's own header:
+
+```yaml
+stp_document:
+  header: "My Project Test plan"
+```
+
+**scenario_tiers** (optional, auto mode) -- Label Section III scenarios with
+your team's tiers instead of auto mode's test types (`functional`, `e2e`, ...).
+Labels only: stubs and tests are still generated from the auto-detected
+framework. tier-classifier decides by each `description` (and by
+`repo_rules.testing_tiers` when fetched); a `marker` is listed in the stub and
+becomes a `@pytest.mark.{marker}` decorator in the generated test.
+
+```yaml
+scenario_tiers:
+  - tier: "Tier 1"
+    description: "Single feature in isolation"
+  - tier: "Tier 2"
+    description: "Complete user workflows, multi-feature integration, upgrades"
+  - tier: "Tier 3"
+    description: "High execution cost: Windows guests, scale, soak"
+    marker: "tier3"
+```
+
 **time_saved** -- Per-team calibration for the dashboard's "Time Saved"
 estimate. Any subset overrides the shared defaults in `_defaults.yaml`; unset
 keys inherit. These are assumptions about by-hand authoring effort, not measured
@@ -240,6 +266,30 @@ tier2_repo:
   full_name: "my-org/my-project-e2e"
   default_branch: "main"
   language: "python"
+```
+
+**design_docs_repo** + **repo_files** (optional, recommended) -- Where the team
+keeps its STPs and STP template. project-resolver fetches each `repo_files`
+entry into `project_context.repo_rules` at run time (toggle `repo_files_fetch`);
+`stp_template` then outranks every local template, so generated STPs follow the
+team's current template instead of QF's bundled copy. `fallback` is read from
+the project's config dir when the fetch fails.
+
+```yaml
+design_docs_repo:
+  name: "my-project-design-docs"
+  org: "my-org"
+  full_name: "my-org/my-project-design-docs"
+  default_branch: "main"
+
+repo_files:
+  stp_template:                        # used by template-engine, stp-generator, stp-reviewer
+    repo: "design_docs_repo"
+    path: "stps/stp-template/stp.md"
+    fallback: "templates/stp/stp-template.md"
+  stp_guide:     { repo: "design_docs_repo", path: "docs/stp-guide.md", fallback: null }
+  testing_tiers: { repo: "design_docs_repo", path: "docs/testing-tiers.md", fallback: null }
+  stp_review_rules: { repo: "design_docs_repo", path: "AGENTS.md", fallback: null }  # stp-reviewer
 ```
 
 ### components.yaml
