@@ -8,7 +8,7 @@ language: "python"
 framework: "pytest"
 reference_guide: "https://github.com/RedHatQE/openshift-virtualization-tests/blob/main/docs/SOFTWARE_TEST_DESCRIPTION.md"
 reference_tests:
-  - "https://github.com/RedHatQE/openshift-virtualization-tests/tree/main/tests/storage"
+  - "https://github.com/RedHatQE/openshift-virtualization-tests/blob/main/tests/storage/online_resize/test_online_resize.py"
 imports:
   framework:
     - "pytest"

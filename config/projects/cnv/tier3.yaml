@@ -8,9 +8,11 @@ language: "python"
 framework: "pytest"
 reference_guide: "https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/docs/testing-tiers.md"
 reference_tests:
-  - "https://github.com/RedHatQE/openshift-virtualization-tests/tree/main/tests"
+  - "https://github.com/RedHatQE/openshift-virtualization-tests/blob/main/tests/storage/memory_dump/test_memory_dump.py"
 markers:
   - "tier3"
+  - "special_infra"
+  - "windows"
 imports:
   framework:
     - "pytest"
