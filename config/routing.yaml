@@ -9,6 +9,7 @@ routes:
       - "VIRTSTRAT"
     github_repos:
       - "kubevirt/kubevirt"
+      - "kubevirt/enhancements"
       - "kubevirt/containerized-data-importer"
       - "kubevirt/kubevirt-velero-plugin"
       - "RedHatQE/openshift-virtualization-tests"

@@ -62,6 +62,14 @@ additional_repos:
     language: "go"
     local_path_env: "KUBEVIRT_REPO_PATH"
 
+  - name: "enhancements"
+    org: "kubevirt"
+    full_name: "kubevirt/enhancements"
+    url: "https://github.com/kubevirt/enhancements"
+    default_branch: "main"
+    language: "markdown"
+    local_path_env: "KUBEVIRT_ENHANCEMENTS_REPO_PATH"
+
   - name: "openshift-python-wrapper"
     org: "RedHatQE"
     full_name: "RedHatQE/openshift-python-wrapper"
