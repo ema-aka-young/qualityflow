@@ -26,12 +26,14 @@ hand).** From the repo root:
 
 ```bash
 python3 skills/std-reviewer/validate_std.py <std_yaml> \
-  [--stp <stp_file>] [--stubs DIR ...] [--priority P0] [--yaml]
+  [--stp <stp_file>] [--stubs DIR ...] [--priority P0] [--polarion-lint] [--yaml]
 ```
 
 The STP defaults to `document_metadata.stp_reference.file` and the stub dirs to
 the `*-tests/` directories next to the STD YAML, so the usual invocation is just
-the STD path.
+the STD path. Add `--polarion-lint` when `project_context.feature_toggles.polarion_lint`
+is true: every Python stub's `def` line must then carry `# noqa: PID001`
+(`stubs.polarion_lint`). With no shell, check that by hand too, like the rest.
 
 - Exit code 0: no errors (warnings may still be listed — relay them).
 - Exit code 1: at least one FAIL — every listed error is a finding.
@@ -51,11 +53,19 @@ the scenario array; per-scenario required fields, `test_id` format and Jira
 match, duplicate ids, priority and coverage_status values, empty
 `test_execution`; STP Section III requirement -> STD scenario coverage both
 ways (gaps and orphans) by set difference; STP vs STD scenario counts; and per
-stub file: module reference header, per-test reference line, `qf_test_id`
-marker, PSE sections, collection disabled, implementation leakage, and stub <->
-scenario coverage by id. The reference is `STP:` when the STD has an STP and
+stub file: module reference header, per-test reference line, the Python
+`[TS-...]` docstring id tag, no `@pytest.mark.qf_test_id` on a stub (pytest still
+imports the module, so a `--strict-markers` repo that does not register the mark
+fails collection), PSE sections, collection disabled, implementation leakage,
+and stub <-> scenario coverage by id. The reference is `STP:` when the STD has an STP and
 `Jira:` when it does not (bug fixes and other non-STP inputs) — exactly one of
-the two, per test.
+the two, per test. With no STP, `document_metadata.jira_url` replaces
+`stp_reference`. A scenario with its own `jira_url` must be linked by that exact
+URL in its test. A scenario with a `polarion_id` must list
+`polarion("{polarion_id}")` under its test docstring's `Markers:`, and no stub
+may carry a live `pytest.mark.polarion` with a real id (a repo's sync job can
+mark the case Automated from it). A scenario whose `source_pse` is
+`partial` or `missing` needs a `Source:` line naming the proposed sections.
 
 **Map to severity:** a `traceability.*` or `scenarios.test_execution_present`
 error is **CRITICAL**; every other error is **MAJOR**; warnings are **MINOR**
@@ -95,23 +105,21 @@ review_rules: <from review_rules.yaml, if available>
 
 ### repo_rules Integration
 
-When `project_context.repo_rules` is available, validate stubs against the target repo's
-standards. **Severity: MAJOR** for any violation — these are the team's own standards and
-violations cause PR review friction.
+When `project_context.repo_rules` holds the target repo's own rules (`agents_rules`,
+`std_format`), validate the stubs against what those files state: markers the suite adds
+by itself, forbidden constructs, fixture naming, helper placement, how dependent tests
+are declared, `__test__ = False` placement, docstring layout and wording. **Severity:
+MAJOR** for any violation — these are the team's own standards and violations cause PR
+review friction. Flag only rules a fetched file states, never one carried over from
+another team's repository.
 
-**From `repo_rules.agents_rules` (AGENTS.md):** `tier2` marker NOT explicitly added
-(implicit); team markers (`network`, `storage`, ...) NOT explicitly added; no
-`pytest.skip/skipif` anywhere; fixture names are nouns, not verbs; `__test__ = False`
-placement per rules (class-level for grouped, after function for standalone);
-`conftest.py` holds only fixtures (no helpers); module docstring contains the STP link;
-resources named by function ("client pod"), not generic labels ("pod-A");
-`@pytest.mark.incremental` for dependent tests, not `pytest-dependency`.
-
-**From `repo_rules.std_format` (SOFTWARE_TEST_DESCRIPTION.md):** PSE docstrings use exact
-section names `Preconditions:`, `Steps:`, `Expected:`; `[NEGATIVE]` indicator on failure
-scenarios; assertion wording follows the document's patterns; shared preconditions in
-class/module docstring, test-specific in test docstring; each test verifies ONE thing
-with ONE `Expected:` assertion; no fixture names in Preconditions (natural language).
+QualityFlow's own stub rules apply alongside them: PSE section names exactly
+`Preconditions:`, `Steps:`, `Expected:`; `[NEGATIVE]` on failure scenarios; shared
+preconditions in the class/module docstring, test-specific ones in the test docstring;
+each test verifies ONE thing with ONE `Expected:` assertion; Preconditions in natural
+language, no fixture names; the STP link, or the RFE/Jira link when there is no STP, in
+the module, class or test docstring, keyed `STP:` / `Jira:` even where a fetched guide's
+examples write `STP Reference:`.
 
 ## Output
 
@@ -172,7 +180,11 @@ array counts. **CRITICAL:** any mismatch.
 #### 1d. STP Reference
 
 `document_metadata.stp_reference.file` points to the actual STP file, valid path,
-expected pattern. **MAJOR:** wrong path or missing file.
+expected pattern. **MAJOR:** wrong path or missing file. An STD built from a
+scenario list has no STP: `stp_reference` is null and `document_metadata.jira_url`
+takes its place. Do not ask for an STP there. Nor flag what only an STP could
+supply: `stp_scenario_id` is null, and `priority_comment` states the source's
+own priority.
 
 #### 1e. Priority-Testability Consistency
 
@@ -207,21 +219,24 @@ follow-up STD.
 
 Every scenario must have: `scenario_id` (sequential); `test_id` (format per config
 `patterns.test_id_format`, default `TS-{JIRA_ID}-{NUM:03d}`); `tier` (a project-defined
-tier); `priority` ("P0"/"P1"/"P2"); `requirement_id` (Jira key); `requirement_ids`
-(v2.1: non-empty, verbatim from STP); `stp_scenario_id` (v2.1: e.g. "TS-01", verbatim);
-`patterns` (primary + helpers); `variables` (closure_scope array); `test_structure`
-(describe/context/it); `code_structure`; `test_objective` (title, what, why,
-acceptance_criteria); `test_data` (resource_definitions and/or api_endpoints);
-`test_steps` (setup, test_execution, cleanup arrays); `assertions` (≥1).
+tier), or `test_type` in auto mode without `scenario_tiers`; `priority`
+("P0"/"P1"/"P2"); `requirement_id` (Jira key); `requirement_ids` (v2.1: non-empty,
+verbatim from STP); `stp_scenario_id` (v2.1: e.g. "TS-01", verbatim); `test_objective`
+(title, what, why, acceptance_criteria); `test_data` (resource_definitions and/or
+api_endpoints); `test_steps` (setup, test_execution, cleanup arrays); `assertions`
+(≥1). Tier mode adds `patterns` (primary + helpers); Ginkgo tiers (tier config
+`framework: "ginkgo-v2"`) also add `variables` (closure_scope array), `test_structure`
+(describe/context/it) and `code_structure`. Never ask for these four in auto mode,
+or the last three for another framework (std-generator, Ginkgo-only sections).
 
 **CRITICAL:** any required field missing; `test_id` not in the expected format.
 **MAJOR:** duplicate `scenario_id`/`test_id`; `tier` not matching any project tier.
 
 #### 2c. v2.1-Specific Checks
 
-**Universal (all tiers):** `variables.closure_scope` includes the tier-appropriate
-required variables (config `patterns.closure_scope_required`); every scenario with setup
-steps has corresponding cleanup steps.
+**Universal (all tiers):** every scenario with setup steps has corresponding cleanup
+steps. **Ginkgo tiers:** `variables.closure_scope` includes the required variables
+(config `patterns.closure_scope_required`).
 
 **Per-tier framework checks** — match each scenario's `tier` to its tier config's
 `language`/`framework`; do NOT assume which tier uses which language — read the project's
@@ -233,16 +248,15 @@ steps has corresponding cleanup steps.
 (or per config).
 
 *Python (tier config `language: "python"`):* no Go constructs (Ordered, BeforeAll,
-ExpectWithOffset); `@pytest.mark.incremental` for dependent tests, not
-`pytest-dependency` (if `pytest`); fixture names are nouns (per repo_rules); no
-`pytest.skip/skipif` (per repo_rules).
+ExpectWithOffset); dependent tests, fixture naming and forbidden constructs follow the
+target repo's rules (`repo_rules`) where it states them.
 
 *Cross-framework:* no constructs from one tier's language in a different-language tier's
 scenarios.
 
 **MAJOR:** missing required closure_scope variables; missing Ordered on a Go/Ginkgo
-scenario; framework mismatch across languages; `pytest-dependency` instead of
-`@pytest.mark.incremental`. **MINOR:** `:=` for a Go closure variable (should be `=`).
+scenario; framework mismatch across languages; a dependency mechanism the repo's rules
+forbid. **MINOR:** `:=` for a Go closure variable (should be `=`).
 
 ---
 

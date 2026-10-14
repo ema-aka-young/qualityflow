@@ -71,9 +71,17 @@ previous output/checksum) but prints a warning.
 | `stp` | `skills_used` |
 | `stp_review` | `verdict`, `findings` |
 | `stp_refine` | `iterations`, `final_verdict`, `findings` |
-| `std` | `stp_checksum_at_generation`, `scenario_counts`, `stubs` |
+| `std` | `stp_checksum_at_generation` (or `scenario_list` and `scenario_list_checksum_at_generation`), `scenario_counts`, `stubs` |
 | `std_review` | `verdict`, `findings` |
-| `codegen` | `test_count`, `lsp_patterns_used`, `conftest_generated` |
+| `codegen` | `test_count`, `files`, `lsp_patterns_used`, `verification`, `verification_reason` |
+
+`verification` is the offline check of the generated tests inside the tests
+repo checkout (`skills/test-generator/repo_context.py verify`: collect or
+compile, never a test run): `passed`, `failed` or `skipped`; complete-phase
+refuses any other value. codegen completes whatever it says: anything but
+`passed` means the tests are unverified, and the dashboard labels the phase
+experimental. `start-phase` clears the previous run's `verification` and
+`verification_reason`.
 
 ### 3b. Record Usage on a Phase
 
@@ -150,7 +158,12 @@ phases:
   stp_refine: {status: pending, error: null}
   std: {status: pending, error: null}
   std_review: {status: pending, error: null}
-  codegen: {status: pending, error: null}
+  codegen:
+    status: completed
+    test_count: 4
+    verification: skipped        # passed | failed | skipped
+    verification_reason: "uv is not installed"
+    error: null
 ```
 
 ## Prerequisite Chains (enforced by `check`)
@@ -164,16 +177,23 @@ phases:
 | `std_review` | `std.status == completed` |
 | `codegen` | `std.status == completed` AND `std_review` approved (if gated) |
 
+**A ticket whose only input is a scenario list** (`outputs/{JIRA_ID}/input/{JIRA_ID}_scenarios.yaml`
+and no STP) starts at `std`: `check` skips its `stp` prerequisite and the
+`stp_review` gate, and `status` suggests `/std-builder` first.
+
 ## Approval Gates
 
 Gates come from `project.yaml` (`approval_gates` list, default:
-`[stp_review, std_review]`). Approval state lives in
+`[stp_review, std_review]`). A person records the decision from the dashboard
+or with `/approve {JIRA_ID} stp|std` (`state.py approve {JIRA_ID} stp|std
+[--reject] [--by NAME] [--comment TEXT]`). Both write
 `outputs/{JIRA_ID}/state/approvals.yaml`:
 
 ```yaml
-approvals:
-  stp_review: {status: approved}   # approved | rejected
+stp_review: {status: approved, reviewer: jsmith, comment: "", timestamp: ...}  # approved | rejected
 ```
+
+An older file with the entries under `approvals:` still counts.
 
 | Downstream Phase | Required Gate (if configured) |
 |:----------------|:-----------------------------|
@@ -193,6 +213,7 @@ stored checksum:
 | `std` | STP file | `stp.output_checksum` |
 | `std_review` | STD YAML | `std.output_checksum` |
 | `codegen` | STD YAML | `std.output_checksum` |
+| `std_review`, `codegen` (scenario-list ticket) | the scenario list | `std.scenario_list_checksum_at_generation` |
 
 Staleness warns but never blocks — suggest re-running the upstream builder
 (`/std-builder` when the STP changed, `/generate-tests` when the STD changed).

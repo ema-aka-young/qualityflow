@@ -139,6 +139,8 @@ Pass:
 project_context: <from stp-builder>
 changed_files: [<list of changed file paths from github-pr-fetcher, may be empty>]
 jira_data:
+  key: <JIRA_ID>
+  linked_keys: [<linked issue keys>]   # with key: the existing-test search terms (Step 3.6)
   summary: <jira summary>
   description: <jira description>
   components: <jira components>
@@ -156,7 +158,7 @@ jira_data:
 
 Consumes the agent's Output Format as documented in `agents/regression-analyzer.md`.
 
-**Phase summary:** Phase 3 Complete — Regression: the number of impacted features, recommended tests, and LSP-validated candidates.
+**Phase summary:** Phase 3 Complete — Regression: the number of impacted features, recommended tests, and LSP-validated candidates. If the regression-analyzer's response starts with an `LSP unavailable (...)` line, print that line verbatim right after this summary.
 
 ### Step 3: Core Processing Phase (Sequential)
 
@@ -185,6 +187,7 @@ regression_data:
   context_only_items: <from regression-analyzer>
   call_graph_evidence: <from regression-analyzer — TRIMMED, see below>
   existing_test_coverage: <from regression-analyzer>
+  existing_coverage_check: <from regression-analyzer — "ran" or "skipped (<reason>)">
   coverage_summary: <from regression-analyzer>
 ```
 
@@ -224,6 +227,7 @@ Report to user:
 - File saved at: `<file_path>`
 - Test scenario counts: Tier 1: X, Tier 2: Y, Total: Z
 - Any validation warnings
+- The `LSP unavailable (...)` line from Phase 3, verbatim, if there was one
 
 ## Error Handling
 

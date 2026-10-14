@@ -34,6 +34,122 @@ RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 ARG CLAUDE_CODE_VERSION=2.1.270
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+# LSP (lsp_analysis, on by default). Claude Code's LSP tool needs two things:
+# a code-intelligence plugin (gopls-lsp / pyright-lsp from the official
+# marketplace, enabled in /app/.claude/settings.json by deploy.py below) and
+# the language server binary on PATH. Without them every run silently fell
+# back to grep. pyright-langserver ships in the pyright npm package. gopls
+# loads packages through `go list`, so it needs the Go toolchain at runtime
+# too — that is most of the growth: ~+300 MB (Go ~230 MB, gopls ~35 MB,
+# pyright ~35 MB, plugin seed <10 MB).
+ARG PYRIGHT_VERSION=1.1.414
+RUN npm install -g "pyright@${PYRIGHT_VERSION}"
+# GOPROXY/GOTOOLCHAIN set explicitly: RHEL's go.env may default to direct
+# fetches, and auto lets a gopls newer than dnf's Go still build. GOPATH and
+# GOCACHE are build-only scratch, removed in the same layer. GOFLAGS=-p=2
+# caps parallel compiles: a build pod with a process limit failed this step
+# with "fork/exec .../compile: resource temporarily unavailable" in 2 of 3
+# builds; slower, but it passes every time.
+ARG GOPLS_VERSION=v0.20.0
+RUN dnf install -y golang && dnf clean all && \
+    GOPROXY=https://proxy.golang.org,direct GOTOOLCHAIN=auto GOFLAGS=-p=2 \
+    GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
+      go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" && \
+    rm -rf /tmp/gopath /tmp/gocache
+# More languages, the ones Red Hat teams most often test (official Claude Code
+# plugins below; the same servers back the bridge). Go and Python are always
+# in; LSP_EXTRA_LANGUAGES picks the rest, so a team builds only what its repos
+# use. Measured installed size: typescript ~26 MB, java ~263 MB (JDK 21 +
+# jdtls), c ~231 MB (clangd + LLVM), rust ~332 MB (toolchain + std source +
+# rust-analyzer). Ruby/PHP/C#/Kotlin/Swift/Lua have plugins too; add them here
+# when a team needs one.
+ARG LSP_EXTRA_LANGUAGES="typescript java c rust"
+ARG TYPESCRIPT_LANGUAGE_SERVER_VERSION=6.0.1
+ARG TYPESCRIPT_VERSION=5.9.3
+RUN case " ${LSP_EXTRA_LANGUAGES} " in *" typescript "*) \
+      npm install -g "typescript-language-server@${TYPESCRIPT_LANGUAGE_SERVER_VERSION}" \
+        "typescript@${TYPESCRIPT_VERSION}" ;; esac
+# rust-src: rust-analyzer needs the standard library's source to resolve std types.
+RUN pkgs=""; \
+    case " ${LSP_EXTRA_LANGUAGES} " in *" c "*) pkgs="$pkgs clang-tools-extra" ;; esac; \
+    case " ${LSP_EXTRA_LANGUAGES} " in *" java "*) pkgs="$pkgs java-21-openjdk-headless" ;; esac; \
+    case " ${LSP_EXTRA_LANGUAGES} " in *" rust "*) pkgs="$pkgs cargo rust-src" ;; esac; \
+    if [ -n "$pkgs" ]; then dnf install -y $pkgs && dnf clean all; fi
+# 1.50.0, not newer: 1.55+ answers initialize with an LSP 3.18 capability
+# (textDocumentContent) that mcp-language-server v0.1.1 cannot parse, so Codex
+# runs got no Java LSP (verified in this image). Bump both together.
+ARG JDTLS_VERSION=1.50.0
+ARG JDTLS_BUILD=202509041425
+ARG JDTLS_SHA256=3292c5c33888f95ab0ff718e777ee94ff5496b8635a23a8844b876ee090ebdea
+# config_*: Eclipse writes its configuration area there; group 0 + g+w lets
+# OpenShift's arbitrary UID (always in group 0) write it.
+RUN case " ${LSP_EXTRA_LANGUAGES} " in *" java "*) ;; *) exit 0 ;; esac; \
+    curl -fsSL -o /tmp/jdtls.tar.gz \
+      "https://download.eclipse.org/jdtls/milestones/${JDTLS_VERSION}/jdt-language-server-${JDTLS_VERSION}-${JDTLS_BUILD}.tar.gz" && \
+    echo "${JDTLS_SHA256}  /tmp/jdtls.tar.gz" | sha256sum -c - && \
+    mkdir -p /opt/jdtls && tar --no-same-owner -xzf /tmp/jdtls.tar.gz -C /opt/jdtls && rm /tmp/jdtls.tar.gz && \
+    chmod -R a+rX /opt/jdtls && chgrp -R 0 /opt/jdtls/config_* && chmod -R g+w /opt/jdtls/config_* && \
+    ln -s /opt/jdtls/bin/jdtls /usr/local/bin/jdtls
+ARG RUST_ANALYZER_VERSION=2026-10-05
+ARG RUST_ANALYZER_SHA256_X86_64=28070188df63b6f217768040781decc8db43bc9d29b126847acb365575b09bc9
+ARG RUST_ANALYZER_SHA256_AARCH64=3974c863acbbd96ef2cc02a7aaa79123935b05f27ffe4fd393fc229522f75cb9
+RUN case " ${LSP_EXTRA_LANGUAGES} " in *" rust "*) ;; *) exit 0 ;; esac; \
+    case "$(uname -m)" in \
+      x86_64|amd64) RA_ARCH=x86_64; RA_SHA256="${RUST_ANALYZER_SHA256_X86_64}" ;; \
+      aarch64|arm64) RA_ARCH=aarch64; RA_SHA256="${RUST_ANALYZER_SHA256_AARCH64}" ;; \
+      *) echo "unsupported arch for rust-analyzer: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/ra.gz \
+      "https://github.com/rust-lang/rust-analyzer/releases/download/${RUST_ANALYZER_VERSION}/rust-analyzer-${RA_ARCH}-unknown-linux-gnu.gz" && \
+    echo "${RA_SHA256}  /tmp/ra.gz" | sha256sum -c - && \
+    gunzip -c /tmp/ra.gz > /usr/local/bin/rust-analyzer && rm /tmp/ra.gz && \
+    chmod 0755 /usr/local/bin/rust-analyzer && rust-analyzer --version
+# Codex has no LSP tool: mcp-language-server puts the servers above behind MCP
+# tools (definition, references, hover, diagnostics). pipeline_runner starts
+# one per checked-out repo for Codex STP and codegen runs.
+# Built from the tag with deploy/mcp-language-server.patch, which fixes two
+# hangs seen on a pilot cluster (2026-10-08): the bridge opened every workspace
+# file, so pyright type-checked a whole large Python tests repo before answering
+# anything (3 of 4 calls never returned) and gopls held ~1 GB more on a large Go repo;
+# and when its language server died (an OOM kill) it kept the MCP call open
+# until the client's timeout, 5 minutes per call. Pre-opening is now opt-in
+# (MCP_LSP_PRELOAD=1, which pipeline_runner sets for typescript-language-server
+# only) and the bridge exits with its server.
+ARG MCP_LANGUAGE_SERVER_VERSION=v0.1.1
+COPY deploy/mcp-language-server.patch /tmp/mls.patch
+RUN git clone -q --depth 1 --branch "${MCP_LANGUAGE_SERVER_VERSION}" \
+      https://github.com/isaacphi/mcp-language-server /tmp/mls && \
+    git -C /tmp/mls apply /tmp/mls.patch && \
+    cd /tmp/mls && GOPROXY=https://proxy.golang.org,direct GOTOOLCHAIN=auto \
+      GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
+      go build -o /usr/local/bin/mcp-language-server . && \
+    cd / && rm -rf /tmp/mls /tmp/mls.patch /tmp/gopath /tmp/gocache
+# Dashboard runs get a fresh, empty CLAUDE_CONFIG_DIR (pipeline_runner), so
+# the LSP plugins are installed once here, at user scope, into a template the
+# runner copies into each run's config dir. Verified with --debug-file in this
+# image: plugins enabled only in /app/.claude/settings.json are skipped as
+# "repo-authored", and a CLAUDE_CODE_PLUGIN_SEED_DIR seed registers after the
+# LSP manager has already started with 0 servers.
+# ponytail: the marketplace is not pinned to a commit (its LSP entries are a
+# command name + an extension map). Pin with `...official#<tag>` if it drifts.
+RUN export CLAUDE_CONFIG_DIR=/opt/claude-config CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1 && \
+    claude plugin marketplace add anthropics/claude-plugins-official && \
+    claude plugin install gopls-lsp@claude-plugins-official && \
+    claude plugin install pyright-lsp@claude-plugins-official && \
+    for lang in ${LSP_EXTRA_LANGUAGES}; do \
+      case "$lang" in typescript) p=typescript-lsp ;; java) p=jdtls-lsp ;; \
+        c) p=clangd-lsp ;; rust) p=rust-analyzer-lsp ;; \
+        *) echo "unknown LSP_EXTRA_LANGUAGES entry: $lang" >&2; exit 1 ;; esac; \
+      claude plugin install "$p@claude-plugins-official" || exit 1; \
+    done && \
+    rm -rf /opt/claude-config/plugins/marketplaces/*/.git /opt/claude-config/backups && \
+    chmod -R a+rX /opt/claude-config
+# QF_REPOS_DIR: ui.py shallow-clones every configured team repo here and sets
+# its <NAME>_REPO_PATH, so dashboard runs have checkouts to analyze.
+ENV QF_CLAUDE_CONFIG_TEMPLATE=/opt/claude-config \
+    QF_REPOS_DIR=/tmp/qualityflow-team-repos \
+    ENABLE_LSP_TOOL=1
+
 # Codex CLI, pinned so an image rebuild cannot silently change the agent
 # runtime. The explicit platform package avoids npm optional-dependency
 # resolution issues on Linux builders while retaining arm64 support.
@@ -135,6 +251,47 @@ RUN printf '%s\n' \
 # Claude Code, so no format translation is needed here). A straight copy
 # instead of a second printf keeps the two files provably identical.
 RUN mkdir -p /app/.cursor && cp /app/.mcp.json /app/.cursor/mcp.json
+
+# --- RTK (github.com/rtk-ai/rtk): compresses shell-command output for the agents
+# a pipeline run starts, so tool output costs fewer input tokens. Self-contained
+# block: the pinned release binary, then its Claude hook and Codex instruction.
+# Bump RTK_VERSION and both digests together (`gh release view vX -R rtk-ai/rtk
+# --json assets`); the build fails on a digest mismatch, never installs unverified.
+ARG RTK_VERSION=0.42.4
+ARG RTK_SHA256_X86_64=34975116da11e09e502501daf758143e0b22ed3a42a10eb67fb693a6270d9e36
+# x86_64 only: the release's arm64 build is glibc-linked and needs GLIBC_2.39,
+# newer than UBI9's 2.34 (seen in a local arm64 build); there is no static
+# arm64 build. An arm64 image (a laptop build) ships without rtk, and the two
+# steps below then add neither the hook nor the instruction.
+RUN case "$(uname -m)" in \
+      x86_64|amd64) RTK_TARGET=x86_64-unknown-linux-musl; RTK_SHA256="${RTK_SHA256_X86_64}" ;; \
+      *) echo "rtk: no build for $(uname -m) that runs on UBI9; skipped" >&2; exit 0 ;; \
+    esac; \
+    mkdir /tmp/rtk && \
+    curl -fsSL -o /tmp/rtk/rtk.tar.gz \
+      "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-${RTK_TARGET}.tar.gz" && \
+    echo "${RTK_SHA256}  /tmp/rtk/rtk.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/rtk/rtk.tar.gz -C /tmp/rtk && \
+    install -m 0755 /tmp/rtk/rtk /usr/local/bin/rtk && \
+    rm -rf /tmp/rtk && \
+    rtk --version | grep -qx "rtk ${RTK_VERSION}"
+# Claude: pipeline_runner gives each Claude run a fresh, empty CLAUDE_CONFIG_DIR,
+# so user-level hooks never apply; project settings in /app/.claude do. Same
+# PreToolUse entry `rtk init -g` writes. Merged into any settings.json already
+# there, so another step writing that file keeps its keys.
+RUN if command -v rtk >/dev/null; then python3 -c 'import json, pathlib; p = pathlib.Path("/app/.claude/settings.json"); s = json.loads(p.read_text()) if p.exists() else {}; s.setdefault("hooks", {}).setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}); p.write_text(json.dumps(s, indent=2) + "\n")'; fi
+# Codex: rtk has no Codex hook (`rtk init --codex` only writes instructions),
+# so this is an INSTRUCTION, not enforced: Codex reads AGENTS.md from its
+# working directory (/app, pipeline_runner's cwd). Image-only, so laptop runs,
+# where rtk may be absent, never see it. Cursor's `agent` reads it too.
+RUN command -v rtk >/dev/null || exit 0; printf '%s\n' \
+    '# Shell commands' \
+    '' \
+    'Prefix shell commands with `rtk` (installed on PATH), e.g. `rtk git status`,' \
+    '`rtk ls`, `rtk pytest -q`: it compresses their output. Commands rtk' \
+    'does not know pass through unchanged; `rtk proxy <cmd>` gives raw output.' \
+    > /app/AGENTS.md
+# --- end RTK
 
 RUN mkdir -p /app/outputs /data/config
 

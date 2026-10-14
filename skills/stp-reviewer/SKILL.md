@@ -57,8 +57,8 @@ When `project_context.repo_rules` is available:
   categories, entry/exit criteria, STP lifecycle.
 - **`testing_tiers`** — defines Tier 1 vs Tier 2 for this project; use for Rule J and
   Dimension 3 tier-distribution checks.
-- **`stp_review_rules`** — the team's own STP review checklist (for CNV, the
-  design-docs repo's `AGENTS.md`, which CodeRabbit and human reviewers apply to STP
+- **`stp_review_rules`** — the team's own STP review checklist (for example the
+  design-docs repo's `AGENTS.md`, which its bots and human reviewers apply to STP
   PRs). Apply its section checklists in addition to these dimensions, mapping its
   CRITICAL/HIGH to CRITICAL/MAJOR. Its "no placeholders in an approved STP" rule is
   checked at approval time by people, not on a QF draft — see Rule B.
@@ -246,7 +246,7 @@ MAJOR otherwise.
 | Environment (II.3) | Infrastructure/platform needs | Risks (→ II.5) |
 | Tools (II.3.1) | Non-standard tools only | Standard tools |
 | Risks (II.5) | Genuine uncertainties + mitigations | Environment requirements (→ II.3) |
-| Limitations (I.2) | Feature boundaries/restrictions | Out-of-scope items (→ II.1) |
+| Limitations (I.2) | Product constraints | Out-of-scope items, test constraints (→ II.1) |
 | Section III | Testable behaviors + requirement mapping | Prerequisites, setup instructions |
 
 **MAJOR:** content in the wrong section — scenarios in Scope; infrastructure as
@@ -255,11 +255,17 @@ Scope/Goals; user stories in Technology Challenges (I.3) instead of I.1; Testabi
 describing specific test cases (Testability = *whether* testable, not *what* to test);
 step-level detail in the general description. **MINOR:** borderline cases.
 
-**Limitation vs Out-of-Scope:** Limitation (I.2) = a constraint *prevents* testing ("not
-supported by the product"); Out of Scope (II.1) = a deliberate *decision* not to test
-("follow-up cycle"). **MAJOR:** item misfiled per this distinction, either direction.
-**MINOR:** out-of-scope item with risk implications but no II.5 entry acknowledging the
-gap with a mitigation.
+**Limitation vs Out-of-Scope:** Known Limitation (I.2) = a *product constraint* ("not
+supported by the product"); Out of Scope (II.1) = a deliberate QE *decision* not to test
+("follow-up cycle"); Test Limitation (II.1) = a constraint on QE ("no hardware in the
+lab"); Risk (II.5) = an uncertainty. **MAJOR:** item misfiled per this distinction, any
+direction.
+
+**One home per item:** each item lives in exactly one of those four; another section
+may only point to it ("see Known Limitations"). **MAJOR:** the same item repeated as an
+item in two of them (the output validator's `content.one_home_per_item` catches
+near-identical titles; flag reworded copies too). **MINOR:** an out-of-scope item that
+leaves a coverage gap without a pointer to it — a pointer, not a copy in II.5.
 
 #### Rule M — Deletion Test (ISTQB)
 
@@ -332,7 +338,7 @@ higher-tier test.
 #### Rule Q — Requirement ID Format
 
 **MAJOR:** bare `REQ-{NN}` or `REQ-{WORD}-{NN}` where `{WORD}` is not the Jira ticket's
-actual key (e.g. `REQ-01`, `REQ-NAD-001`) — collides across tickets, untraceable.
+actual key (e.g. `REQ-01`, `REQ-NET-001`) — collides across tickets, untraceable.
 **Acceptable:** a Jira key verbatim (`PROJ-72329`) or `REQ-{JIRA_KEY}-{NN}`
 (`REQ-PROJ-72329-01`).
 
@@ -414,9 +420,11 @@ internal-mechanism language; duplicate scenarios. **MINOR:** >15 words.
 **Duplicates are judged across the whole section**, per scenario-builder "Goals and
 scenarios are not duplicated": two scenarios with the same setup and action where one's
 outcome continues or restates the other's ("startup waits until pull finalization" /
-"guest starts after pull finalization") are one scenario — **MAJOR**, name both ids and
+"workload starts after pull finalization") are one scenario — **MAJOR**, name both ids and
 the merged wording. Same for Testing Goals that restate each other or split one outcome
-per mode. **MINOR:** invented paraphrases where the feature has a user-facing term
+per mode. Mode variants (push/pull, Linux/Windows) with the same expected result
+split into one row each — **MAJOR**, name the pairs and the merged wording; a
+Testing Goals list that maps one-to-one onto the scenarios — **MAJOR**. **MINOR:** invented paraphrases where the feature has a user-facing term
 ("recoverable history" for "checkpoint"); `TS-{NN}` ids out of document order while no
 STD exists yet.
 
@@ -497,7 +505,22 @@ Usability only with a UI component; Upgrade per Rule E; Dependencies per Rule D.
 | Owning SIG | Matches Jira labels/components (config `metadata.sig_field`) |
 | Participating SIGs | Reasonable for scope |
 
+Compare each field with `{JIRA_ID}_jira_data.yaml`, value by value: keys and their
+issue types (an Epic is never the Feature), names spelled exactly as Jira has them
+(assignee, QA contact), versions, and any maturity label. Report the field and both
+values for every mismatch. Never write "matches Jira" or "verified" for a field you did
+not compare; say "not compared" and why. The output validator's `content.jira_metadata`
+check covers keys, the QE owner and names mechanically; this dimension covers the rest.
+
+**Identifiers in the body** — metric and label names, feature gates, API fields,
+commands — are checked against the source repository checkout, or the enhancement doc
+when there is none. One the source does not contain, or spells differently, is
+**MAJOR**: a test written from it fails. Text carried over from a parent or related STP
+is checked against the current feature's own source: a mechanism copied from a sibling
+mode (online vs offline, push vs pull) is **MAJOR**.
+
 **MAJOR:** Owning SIG ≠ Jira component/label; Feature Tracking → wrong issue;
+misspelled person's name; QE Owner placeholder while Jira has a QA contact;
 cross-artifact naming inconsistency (STP title vs Jira summary vs STD file name — one
 name across STP/STD/code/Jira); approver/role assignments without actual authority.
 Link/stale-reference checks report under Rule N.

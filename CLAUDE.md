@@ -17,7 +17,7 @@ Requires [uv](https://github.com/astral-sh/uv). No traditional build system — 
 ```bash
 uv run deploy.py --target claude              # Deploy to ~/.claude/
 uv run deploy.py --target cursor              # Deploy to ~/.cursor/
-uv run deploy.py --target codex               # Deploy to ~/.codex/ (agents as TOML, prompts) + ~/.agents/skills/
+uv run deploy.py --target codex               # Deploy to ~/.codex/ (agents as TOML, prompts) + ~/.agents/skills/ (skills, and each command as a $skill)
 uv run deploy.py --target both                # Deploy to claude + cursor
 uv run deploy.py --target all                 # Deploy to claude + cursor + codex
 uv run deploy.py --target both --scope project --project-path /path/to/project
@@ -26,6 +26,12 @@ uv run deploy.py --target both --validate     # Validate configs before deployin
 ```
 
 After deployment, restart Claude Code or Cursor AI to load resources.
+
+For Claude, `deploy.py` also enables the `gopls-lsp` and `pyright-lsp` plugins
+(official marketplace) in `{base}/settings.json`, so `lsp_analysis` (on by
+default) gets an LSP tool. The servers (`gopls`, `pyright-langserver`) must be
+on PATH: `getting-started.py` offers to install them, and the image ships them.
+A run without LSP says `LSP unavailable (<reason>) — used text search`.
 
 ## CI/CD
 
@@ -57,6 +63,10 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
 
 ```
 /stp-builder {JIRA_ID}
+  → when the team's design-docs repo already has the STP for the ticket
+    (default branch or an open PR), it is pulled in unchanged as the STP,
+    with its source in {JIRA_ID}_stp_source.yaml, and the run stops there;
+    `--generate` writes a new one anyway, `--stp <url>` picks the file
   → STP markdown (outputs/{JIRA_ID}/stp/{JIRA_ID}_test_plan.md)
   → auto-chains /review-stp, then /refine-stp --address-findings when the
     review has critical or major findings — one
@@ -73,7 +83,15 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
     scenario list at outputs/{JIRA_ID}/input/{JIRA_ID}_scenarios.yaml
     (format: std-orchestrator Step 1B; validate with
     `validate_std.py --scenarios`). With a scenario list the stp_review gate
-    and the stp.status prerequisite do not apply.
+    and the stp.status prerequisite do not apply. For Polarion, the
+    **polarion-migration** skill writes one list per team after triage and team
+    review (`skills/polarion-migration/migrate.py scenarios`): the cases the
+    team's profile selects (not automated or retired yet), each with its
+    Polarion id and its own Jira requirement. The same skill places the stubs,
+    stages one tests-repo PR per team, and proposes the Polarion clean-up. A
+    team's values (export columns, selection rule, Jira, tests repo, marker
+    policy) live in its profile (`skills/polarion-migration/profile.example.yaml`),
+    never in the engine.
   → STD YAML (outputs/{JIRA_ID}/std/{JIRA_ID}_test_description.yaml)
   → Test stubs (outputs/{JIRA_ID}/std/{language}-tests/, one dir per tier language)
   → auto-chains /review-std, then /refine-std --address-findings when the
@@ -85,14 +103,37 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
   → also runs automatically inside /std-builder; standalone use is for
     re-review of an edited STD
 
+/approve {JIRA_ID} stp|std [--reject]
+  → records a person's decision on the reviewed STP or STD in
+    outputs/{JIRA_ID}/state/approvals.yaml (as the dashboard's Approve does);
+    /std-builder waits for the STP's, /generate-tests for the STD's
+
 /refine-stp {JIRA_ID} --address-findings  (and /refine-std)
   → fixes MAJOR findings + reviewer notes from
     outputs/{JIRA_ID}/reviews/{JIRA_ID}_{stp|std}_feedback.md, even when approved;
-    the dashboard's "Request changes" button runs it
+    the dashboard's "Request changes" button runs it. The document is edited
+    in place, never regenerated. Notes queue up from several people (dashboard
+    "Add note", and "Pull PR comments" from the ticket's PR) and one Request
+    changes applies all of them. "Ask for review" requests reviewers on the
+    PR: peer review is additive and never gates the pipeline
 
 /generate-tests {JIRA_ID}
+  → requires a checkout of the tests repo (the env var its repositories.yaml
+    local_path_env names); stops without one
+  → collects the suite's fixtures/helpers/markers
+    (skills/test-generator/repo_context.py context) as the only allowed vocabulary
   → Working test implementations (language determined by project config)
-  → outputs/{JIRA_ID}/{language}-tests/ (language determined by tier config)
+  → outputs/{JIRA_ID}/{language}-tests/ + the checkout at each file's
+    target_path (recorded in summary.yaml)
+  → verified in the checkout (repo_context.py verify: pytest --setup-plan / go compile only,
+    never a test run); `verification` passed|failed|skipped on the codegen
+    phase, which the dashboard labels experimental until it passes
+
+/push-pr {JIRA_ID} [--folder <stps subfolder>]
+  → opens or updates the PRs that put the STP in the team's design-docs repo
+    (stps/<folder>/{JIRA_ID}.md) and verified tests in its tests repo; never
+    commits to the QualityFlow repo. The dashboard's Push to PR does the same,
+    and updates an open PR in place (refusing to overwrite edits made on it)
 
 /fix-pr {PR_URL} [--dry-run] [--review-id=ID]
   → Fixes STP/STD documents in a PR based on review comments
@@ -112,7 +153,7 @@ The STP pipeline uses sequential agent orchestration:
 
 The **stp-orchestrator** agent coordinates this pipeline. In code generation, `/generate-tests` extracts LSP patterns via the **lsp-tracer** and **feature-finder** skills.
 
-Not every agent is reached from a command. This repo is a Claude Code plugin (`.claude-plugin/plugin.json`), and `deploy.py` also copies `agents/*.md` to `{base}/agents/`; either way every file in `agents/` is registered as an invocable subagent type. So `qualityflow`, `stp-builder`, `std-builder`, `stp-refiner`, `std-refiner`, `stp-reviewer`, `std-reviewer`, `test-generator`, `ticket-context-analyzer`, and `pr-fix-agent` are **direct entry points** — invoked by name (or picked by the agent selector), not referenced from `commands/*.md`. An `agents/*.md` file with no inbound `.md` reference is therefore not dead code; do not treat the absence of one as evidence it can be deleted.
+Not every agent is reached from a command. This repo is a Claude Code plugin (`.claude-plugin/plugin.json`), and `deploy.py` also copies `agents/*.md` to `{base}/agents/`; either way every file in `agents/` is registered as an invocable subagent type. So `qualityflow`, `stp-builder`, `std-builder`, `stp-refiner`, `std-refiner`, `stp-reviewer`, `std-reviewer`, `test-generator`, `ticket-context-analyzer`, `pr-fix-agent`, and `polarion-triager` are **direct entry points** — invoked by name (or picked by the agent selector), not referenced from `commands/*.md`. An `agents/*.md` file with no inbound `.md` reference is therefore not dead code; do not treat the absence of one as evidence it can be deleted.
 
 The **PR fix loop** processes review comments on PRs containing STP/STD documents: it classifies comments (via **comment-classifier**), auto-fixes what it can using existing skills, and flags the rest for human input. It runs when a human invokes `/fix-pr {PR_URL}` — `commands/fix-pr.md` does this work inline — or when the **pr-fix-agent** subagent is invoked directly. No workflow in `.github/workflows/` dispatches either path; there is no `pull_request_review.submitted` trigger in this repo.
 
@@ -128,6 +169,7 @@ Skills are reusable, specialized units invoked by agents. Each skill lives in `s
 - **Review:** stp-reviewer, std-reviewer, review-rules-extractor
 - **PR Fix Loop:** comment-classifier (classifies review comments for auto-fix routing)
 - **Utility:** jira-parser, link-resolver, pii-sanitizer, output-validator, table-generator
+- **Migration:** polarion-migration (Polarion export → triaged, team-approved STD stubs; its W2 agent is **polarion-triager**)
 
 ### MCP Server Integration
 
@@ -190,7 +232,7 @@ Agents then read only the config files they need from `config_dir`.
 
 | Toggle | Default | Effect when false |
 |--------|---------|-------------------|
-| `polarion` | false | Omit Polarion test case markers in stub-generator and test-generator |
+| `polarion` | false | Omit the `PLACEHOLDER` Polarion marker in stub-generator and test-generator. A scenario imported from Polarion lists its real id under its stub's `Markers:` either way |
 | `unit_tests` | false | Informational only (no command or skill gates on this toggle) |
 | `test_strategy` | `"auto"` | `"auto"`: detect language/framework from source repo. `"tier"`: use `tier*.yaml` configs for classification and code generation |
 | `tier1_tests` | true | Block tier 1 test generation in `/generate-tests`, skip tier 1 stubs in `/std-builder`. Only applies when `test_strategy: "tier"`. Legacy — prefer `enabled` field in tier config |
@@ -202,6 +244,7 @@ Agents then read only the config files they need from `config_dir`.
 | `lsp_analysis` | true | Skip regression-analyzer in STP pipeline, skip lsp-tracer/feature-finder in code generation |
 | `pii_sanitization` | true | Skip pii-sanitizer invocation in document-formatter |
 | `repo_files_fetch` | true | Skip project-resolver's repo-file fetch step, so `repo_rules` stays empty and the STP/STD reviewers fall back to generic default rules (lower review confidence) |
+| `polarion_lint` | false | Python stubs get no `# noqa: PID001` on their `def` lines. Set it true for a tests repo that runs the RedHatQE flake8 PolarionIds plugin (`enable-extensions = PID`), which fails every test without `@pytest.mark.polarion("PROJ-<n>")`, stubs included; `/review-std` then runs `validate_std.py --polarion-lint` |
 
 ### Review Rules Resolution
 
@@ -215,6 +258,9 @@ dynamically extracted rules.
 ### Adding a New Project
 
 1. Create `config/projects/{name}/` with required YAML files
+   (`/add-repo <org/repo> --type primary|tier2|design_docs|additional` writes a
+   repo's full `repositories.yaml` entry, including the `local_path_env` the
+   analysis steps need to find its checkout)
 2. Add route(s) in `config/routing.yaml`
 3. Set `feature_toggles` to enable/disable capabilities
 4. Deploy: `uv run deploy.py --target both`
@@ -252,19 +298,28 @@ of tier classification:
 - Scenarios use descriptive labels ("unit", "functional", "integration",
   "e2e") instead of tier numbers — unless `project.yaml` defines
   `scenario_tiers`, in which case they are labelled `[Tier N]` by
-  tier-classifier (labels only; code generation stays auto). CNV does this:
-  its reviewers require Tier 1/2/3, and Tier 3 stubs/tests carry the `tier3`
-  pytest marker
+  tier-classifier (labels only; code generation stays auto, and the STD
+  counts them in `tier_counts`). Use it when the team's reviewers require
+  tiers; a tier's `marker` (e.g. `tier3`) is carried onto its stubs and tests
+  as a pytest marker
 - Code generators read framework and imports from `code_generation_config`
   in the STD YAML, not from `tier*.yaml` configs
+- STD scenarios carry no pattern metadata and none of the Ginkgo-only
+  sections (`variables`, `test_structure`, `code_structure`); std-generator
+  adds those in tier mode only, the Ginkgo ones for `ginkgo-v2` tiers
 - `config_dir: null` is the universal signal to all downstream skills
   that they're in auto-discovery mode
 
 ### Coverage Deduplication
 
 The regression-analyzer produces an `existing_test_coverage` section that
-maps symbols to their existing test functions. The stp-generator uses
-this to tag requirements with `coverage_status`:
+maps symbols to their existing test functions — from LSP references, and from
+a text search of the tests repo checkout (Jira key, feature terms, markers) that
+works for any language; a hit counts only when the test asserts the behaviour.
+With no checkout it records `existing_coverage_check: skipped (<reason>)` and
+the STP says the duplicate check did not run. The stp-generator uses
+this to tag requirements with `coverage_status` (Section III carries
+`[PARTIAL_COVERAGE]` / `[EXISTING_COVERAGE]` after the tier tag):
 
 | Status | Meaning | STP/STD behavior |
 |--------|---------|------------------|
@@ -292,7 +347,8 @@ symbol whose changed lines measure as unhit is downgraded from
 outputs/
 └── {JIRA_ID}/
     ├── stp/
-    │   └── {JIRA_ID}_test_plan.md
+    │   ├── {JIRA_ID}_test_plan.md
+    │   └── {JIRA_ID}_stakeholders.yaml   (people to review/sign off, Section IV)
     ├── reviews/
     │   ├── {JIRA_ID}_stp_review.md
     │   └── {JIRA_ID}_std_review.md
@@ -308,36 +364,52 @@ outputs/
 
 ```
 {target_test_directory}/
-└── qf_{feature}{ext}                   (co-located with production code, naming per language convention)
+├── qf_{feature}_test.go                (Go, co-located with production code)
+└── test_qf_{feature}.py                (Python)
 ```
 
-The `qf_` filename prefix distinguishes QF-generated tests from
-hand-written and FS-generated tests. All `qf_*` files are discoverable
-via `find . -name 'qf_*'`.
+The `qf_` marker distinguishes QF-generated tests from hand-written and
+FS-generated tests. It goes after whatever the language's test discovery
+needs at the start of the name (`test_file_prefix` in `config/_defaults.yaml`):
+go test only needs the `_test.go` suffix, while pytest's default `python_files`
+is `test_*.py *_test.py`. A `qf_{feature}.py` or `qf_test_{feature}.py` is
+collected only when named on the command line, so the tests repo's CI never
+runs it, and Push to PR refuses it. Find QF tests with
+`find . -name 'qf_*_test.go' -o -name 'test_qf_*.py'`.
 
-When `target_test_directory` is unresolvable (no source repo, no
-package mapping), tests fall back to `outputs/{JIRA_ID}/{language}-tests/`.
+`/generate-tests` writes each test into the tests repo checkout at its
+repo-relative `target_path` and keeps a copy in
+`outputs/{JIRA_ID}/{language}-tests/`, whose `summary.yaml` records
+`target_path` per file. With no checkout it stops; it never generates against a
+guessed suite.
 
 ### PSE Format for Test Docstrings
 
 All generated test stubs use Preconditions/Steps/Expected documentation,
 prefixed with the test's own STP reference — or `Jira:` when the STD has no
-STP. It is repeated per test, since tests move between modules:
+STP. It is repeated per test, since tests move between modules. A case
+migrated from Polarion links its own requirement's Jira and lists
+`polarion("{its Polarion id}")` under `Markers:`. It is never a live
+`@pytest.mark.polarion` on a stub: a repo's sync job can mark the case
+Automated from a merged marker line, and a stub is not automated (the
+migration's `package` step renders a team's own form):
 
 ```
-STP: https://.../CNV-12345_test_plan.md
-Preconditions: Running VM, network namespace configured
+STP: https://.../PROJ-12345_test_plan.md
+Preconditions:
+  - Running resource with a configured network namespace
 Steps:
-  1. Create network interface spec
-  2. Call hotplug API
-Expected: Interface attached successfully, traffic flows
+  1. Create a network interface spec
+  2. Call the attach API
+Expected:
+  - Interface is attached and traffic flows
 ```
 
 ### PII Sanitization Rules
 
 - Customer names → `<customer>`, `Example Corp`
 - IP addresses → RFC 5737 examples (192.0.2.0/24)
-- Hostnames → Generic names (worker-node-1, test-vm)
+- Hostnames → Generic names (worker-node-1, test-host)
 - Domains → example.com
 
 ### Pattern Libraries
@@ -379,10 +451,17 @@ review has critical or major findings, mirroring the STP chain. Stub files use t
 are written to `outputs/{JIRA_ID}/std/`.
 
 Phase 2 (Implementation): `/generate-tests` fills in working
-test bodies that compile (Bazel for Go) or pass collection (pytest).
+test bodies inside a checkout of the team's tests repo, using only the
+fixtures, helpers and markers that suite really has (never a `conftest.py`
+that redefines one, never faked utilities). It then collects (pytest, via
+`uv run` when the repo has `uv.lock`) or compiles (`go vet`, `go test -run xxx
+-count=0`) them there and records `verification: passed|failed|skipped` on the
+`codegen` phase. The phase completes either way; anything but `passed` leaves
+it unverified, and the dashboard labels code generation experimental until it
+passes. Collection is the limit of that check: no generated test is run.
 The language and framework are determined by project config.
 Implementations are written to separate directories
-(`outputs/{JIRA_ID}/{language}-tests/`),
+(`outputs/{JIRA_ID}/{language}-tests/`, plus the checkout),
 so Phase 1 stubs are preserved for reference.
 
 ### Automated Review System

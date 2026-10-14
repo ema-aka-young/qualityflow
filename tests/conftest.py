@@ -15,6 +15,11 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_review_cycle_poller(monkeypatch):
+    # Most suites were written against the Claude path (argv, Vertex gates) and
+    # send no runtime, so pin the server default to claude for them. The
+    # default itself (codex) is tested where a test body undoes this pin
+    # (test_default_runtime.py); a test body's monkeypatch runs after this one.
+    monkeypatch.setenv("QF_RUNNER_DEFAULT_RUNTIME", "claude")
     ui = sys.modules.get("ui")  # only patch once a test module has imported ui
     if ui is not None:
         monkeypatch.setattr(ui, "_start_review_cycle_loop", lambda: None)
@@ -23,10 +28,11 @@ def _no_review_cycle_poller(monkeypatch):
         # tests/test_member_identity.py restores the real helper over a mocked urlopen.
         monkeypatch.setattr(ui, "_jira_identity", lambda *a, **k: (None, None))
         # Same shape of leak: _VERTEX_PROJECT is read from the environment at
-        # import, and a developer who exports ANTHROPIC_VERTEX_PROJECT_ID (the
-        # cnv2 value, to drive the dashboard locally) makes every run route
+        # import, and a developer who exports ANTHROPIC_VERTEX_PROJECT_ID (a
+        # deployment's value, to drive the dashboard locally) makes every run route
         # demand a Vertex credential and 400 before the logic under test runs —
         # 29 failures locally, none in CI. Default it off, like CI. The tests
         # that exercise the gate set it themselves and still win: an autouse
         # fixture runs before the test body's own monkeypatch.
         monkeypatch.setattr(ui, "_VERTEX_PROJECT", "")
+        monkeypatch.setattr(ui, "_RUNNER_DEFAULT_RUNTIME", "claude")

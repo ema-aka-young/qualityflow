@@ -91,6 +91,7 @@ These directories are optional but recommended:
 - `patterns/` -- Pattern YAML files for code generation
 - `reference/` -- Example test files the generators learn from
 - `templates/` -- STP/STD/test file templates
+- `polarion-migration/` -- Only for a team migrating off Polarion; see below
 
 ### Step 6: Deploy and test
 
@@ -159,7 +160,8 @@ stp_document:
 **scenario_tiers** (optional, auto mode) -- Label Section III scenarios with
 your team's tiers instead of auto mode's test types (`functional`, `e2e`, ...).
 Labels only: stubs and tests are still generated from the auto-detected
-framework. tier-classifier decides by each `description` (and by
+framework, and the STD counts scenarios in `tier_counts` instead of per-type
+counts. tier-classifier decides by each `description` (and by
 `repo_rules.testing_tiers` when fetched); a `marker` is listed in the stub and
 becomes a `@pytest.mark.{marker}` decorator in the generated test.
 
@@ -172,6 +174,21 @@ scenario_tiers:
   - tier: "Tier 3"
     description: "High execution cost: Windows guests, scale, soak"
     marker: "tier3"
+```
+
+**stakeholders** (optional) -- People every STP of this project lists for
+review and sign-off, beside the ones from Jira (assignee, QA contact, reporter,
+watchers, component leads) and the design-docs repo's CODEOWNERS. stp-generator
+writes them all to `outputs/{JIRA_ID}/stp/{JIRA_ID}_stakeholders.yaml` and fills
+Section IV from it; `role` is the Section IV line an entry fills (e.g. `QE Lead`),
+`github` its handle. The sign-off itself stays a `[Name/Date]` placeholder.
+
+```yaml
+stakeholders:
+  default_reviewers:
+    - {name: "Jane Smith", github: "jsmith", role: "QE"}
+  default_approvers:
+    - {name: "Sam Lee", github: "samlee", role: "QE Lead"}
 ```
 
 **time_saved** -- Per-team calibration for the dashboard's "Time Saved"
@@ -240,7 +257,13 @@ scope_boundaries:
 
 ### repositories.yaml
 
-Repository locations for code analysis and test generation.
+Repository locations for code analysis and test generation. `/add-repo
+<org/repo> [--type primary|tier2|design_docs|additional]` (or the
+**Repositories** section of the dashboard's project settings, or its repo
+import) writes an entry in full; every repo the pipeline should read needs
+`local_path_env`, the variable that points at its local checkout. The
+dashboard section shows each repo as checked out only when that variable is
+set where the dashboard runs and names an existing directory.
 
 **primary_repo** (required) -- The main source code repository:
 
@@ -264,16 +287,40 @@ tier2_repo:
   name: "my-project-e2e"
   org: "my-org"
   full_name: "my-org/my-project-e2e"
+  local_path_env: "TESTS_REPO_PATH"    # Env var pointing to local clone
   default_branch: "main"
   language: "python"
+```
+
+`/generate-tests` requires a local clone of the repo that holds the tests
+(`tier2_repo` when its `language` matches the tests', else `primary_repo`),
+found through that entry's `local_path_env`. It reads the suite's fixtures,
+helpers and markers there, writes the tests into it and checks them with the
+repo's own tooling (`pytest --setup-plan`: collection plus every fixture
+resolved, nothing runs; Go: vet + compile); without the clone it stops.
+
+When the suite cannot even be collected without a cluster (its root conftest
+connects at import), give that entry a `verify:` block with what the repo's own
+CI sets to collect offline (look in its `tox.ini` or CI workflow):
+
+```yaml
+primary_repo:
+  # ...
+  verify:
+    env: {MY_SUITE_ARCH: amd64}             # env vars for the check
+    args: ["--tc-file=tests/config.py"]     # extra pytest arguments
 ```
 
 **design_docs_repo** + **repo_files** (optional, recommended) -- Where the team
 keeps its STPs and STP template. project-resolver fetches each `repo_files`
 entry into `project_context.repo_rules` at run time (toggle `repo_files_fetch`);
 `stp_template` then outranks every local template, so generated STPs follow the
-team's current template instead of QF's bundled copy. `fallback` is read from
-the project's config dir when the fetch fails.
+team's current template instead of QF's bundled copy. `agents_rules` and
+`std_format` point at the tests repo's own contributor rules and STD guide; the
+STD skills apply what they state, and assume no rule they do not state.
+`fallback` is read from the project's config dir when the fetch fails.
+The design-docs repo's `.github/CODEOWNERS` (or `CODEOWNERS`) is read too, when
+present, into `project_context.codeowners`: STP stakeholders (see `stakeholders`).
 
 ```yaml
 design_docs_repo:
@@ -290,6 +337,8 @@ repo_files:
   stp_guide:     { repo: "design_docs_repo", path: "docs/stp-guide.md", fallback: null }
   testing_tiers: { repo: "design_docs_repo", path: "docs/testing-tiers.md", fallback: null }
   stp_review_rules: { repo: "design_docs_repo", path: "AGENTS.md", fallback: null }  # stp-reviewer
+  agents_rules: { repo: "primary_repo", path: "AGENTS.md", fallback: null }  # STD skills + test-generator
+  std_format:   { repo: "primary_repo", path: "docs/STD_GUIDE.md", fallback: null }  # STD skills
 ```
 
 ### components.yaml
@@ -325,6 +374,7 @@ prefixes:
 custom_fields:
   feature_link: "Feature Link"
   git_pull_request: "Git Pull Request"
+  qa_contact: "QA Contact"   # optional: the STP's QE Owner comes from this field
 
 pr_url_scan_pattern: "https://github.com/.*/pull/\\d+"
 ```
@@ -419,7 +469,7 @@ project in `project.yaml`. Project values take precedence.
 
 | Toggle | Default | Effect |
 |--------|---------|--------|
-| `polarion` | `false` | `true`: Include Polarion test case markers in generated test stubs and tests. `false`: Omit markers |
+| `polarion` | `false` | `true`: Include a `PLACEHOLDER` Polarion test case marker in generated test stubs and tests. `false`: Omit it. A scenario imported from Polarion (`polarion_id`) lists its real id under its stub's `Markers:` either way, and its Phase 2 test gets the real decorator |
 | `unit_tests` | `false` | Informational only |
 | `test_strategy` | `"auto"` | `"auto"`: Detect language/framework from source repo (see [Auto vs Tier Mode](#auto-vs-tier-mode)). `"tier"`: Use `tier*.yaml` configs for classification and code generation |
 | `tier1_tests` | `true` | Legacy toggle for backward compat. Prefer `enabled` field in tier config. Only applies when `test_strategy: "tier"` |
@@ -431,6 +481,7 @@ project in `project.yaml`. Project values take precedence.
 | `lsp_analysis` | `true` | `true`: Run regression-analyzer in STP pipeline, run lsp-tracer/feature-finder in code generation. `false`: Skip LSP-based analysis |
 | `pii_sanitization` | `true` | `true`: Run pii-sanitizer in document-formatter. `false`: Skip PII sanitization |
 | `repo_files_fetch` | `true` | `true`: project-resolver fetches the `repo_files` declared in `repositories.yaml` into `repo_rules`. `false`: Skip that step — `repo_rules` stays empty and the STP/STD reviewers fall back to generic default rules (lower review confidence) |
+| `polarion_lint` | `false` | `true`: Every Python stub's `def test_*` line ends with `# noqa: PID001`, and the STD review checks it (`validate_std.py --polarion-lint`). For a tests repo that runs the RedHatQE flake8 PolarionIds plugin (`enable-extensions = PID` in `.flake8`), which reports PID001 on any test without `@pytest.mark.polarion("PROJ-<n>")`, `__test__ = False` stubs included. `false`: No noqa |
 
 ## Auto vs Tier Mode
 
@@ -478,7 +529,7 @@ Sources are tried in order, first answer wins:
 | Source | Needs | Gives |
 |--------|-------|-------|
 | PR coverage check run (`codecov/patch`) | `gh` only | Patch %, per-file %, gate |
-| Local coverage profile | `SOURCE_REPO_DIR` + `coverage_gap.command` | Exact uncovered line numbers |
+| Local coverage profile | `SOURCE_REPO_PATH` + `coverage_gap.command` | Exact uncovered line numbers |
 | CoverPort `product_coverage` | Codecov flag, or registry access | Whether code ever ran in a live env |
 
 The `coverage_gap` section of `coverage.yaml` configures sources 2 and 3;
@@ -647,3 +698,19 @@ Contains templates for document and code generation:
 - `stp/` -- STP markdown templates (`stp-template.md`)
 - `std/` -- STD YAML templates (`std_template.yaml`)
 - `tier{N}/` -- Per-tier test file templates
+
+### polarion-migration/
+
+A team that migrates its Polarion test cases with the **polarion-migration**
+skill can keep its inputs here, on the team's own branch: they are that team's
+values, so they never land on the shared branch.
+
+- `profile.yaml` -- the migration profile: export columns and values, the
+  selection rule, the Jira trace, the tests repo and its marker policy (see
+  `skills/polarion-migration/profile.example.yaml`; check one with
+  `migrate.py check-profile FILE`)
+- `teams.yaml` -- the team map: team roots, owned components, reviewers,
+  tracking Jira, the component -> folder table
+
+`migrate.py init RUN --profile FILE` takes the path; nothing reads this folder
+by name.

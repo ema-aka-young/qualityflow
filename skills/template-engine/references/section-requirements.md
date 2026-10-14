@@ -1,10 +1,8 @@
 # STP Section Requirements Reference
 
 Section-by-section requirements for the bundled fallback template
-(`../templates/stp-template.md`), aligned with the upstream CNV template
-(`RedHatQE/openshift-virtualization-tests-design-docs`, `stps/stp-template/stp.md`).
-When a project fetches its own template (`repo_rules.stp_template`), that
-template wins. The formatting rules — one fact per line, visible placeholders,
+(`../templates/stp-template.md`). When a project fetches its own template
+(`repo_rules.stp_template`), that template wins. The formatting rules — one fact per line, visible placeholders,
 Feature Maturity, sign-offs — are in `../SKILL.md` → Key Design Rules.
 
 ## Section Overview
@@ -126,8 +124,8 @@ line. Add **Other** only for a risk no category fits.
 **No minimum item requirement.** Bullet-based:
 
 ```markdown
-- **[PROJ-72329]** — As a user, I want to hotplug a network interface to a running VM
-  - *Test Scenario:* **TS-01**: [Tier 1] Verify hotplug attaches the interface and traffic flows
+- **[PROJ-72329]** — As a user, I want to hot-attach a network interface to a running resource
+  - *Test Scenario:* **TS-01**: [Tier 1] Verify hot-attach adds the interface and traffic flows
     - *Priority:* P0
 ```
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Caching regressions (wave W6): the PERF-01 defects.
 
-PERF-01-F1   /api/pipelines, /api/pipelines/matrix, /api/metrics/confidence and
-             /api/metrics/roi rescanned every ticket's pipeline_state.yaml on
+PERF-01-F1   /api/pipelines, /api/pipelines/matrix and /api/metrics/roi
+             rescanned every ticket's pipeline_state.yaml on
              every request with no cache, while the sibling /api/metrics/{id}
              and /api/insights already used _metrics_cache
 PERF-01-F2   the Command Center's ~10 parallel fetches all missed together and
@@ -38,7 +38,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(ui.app)
 
-TICKETS = [f"CNV-{n}" for n in range(1, 6)]
+TICKETS = [f"PROJ-{n}" for n in range(1, 6)]
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def outputs(tmp_path, monkeypatch):
     for jira_id in TICKETS:
         _write_state(out, jira_id, {
             "ticket_id": jira_id,
-            "project_id": "cnv",
+            "project_id": "example",
             "updated": "2026-09-01T00:00:00+00:00",
             "phases": {
                 "stp": {"status": "completed", "verdict": "APPROVED",
@@ -90,13 +90,12 @@ def reads(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# PERF-01-F1 — the four hot routes cache their result for the TTL
+# PERF-01-F1 — the three hot routes cache their result for the TTL
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("url", [
     "/api/pipelines",
     "/api/pipelines/matrix",
-    "/api/metrics/confidence",
     "/api/metrics/roi",
 ])
 def test_hot_route_does_not_rescan_within_ttl(outputs, reads, url):
@@ -130,13 +129,13 @@ def test_state_write_invalidates(outputs, reads):
     assert len(before) == len(TICKETS)
 
     ui._atomic_yaml_update(
-        _state_path(outputs, "CNV-6"),
-        lambda _data: {"ticket_id": "CNV-6", "project_id": "cnv",
+        _state_path(outputs, "PROJ-6"),
+        lambda _data: {"ticket_id": "PROJ-6", "project_id": "example",
                        "phases": {"stp": {"status": "completed"}}},
     )
 
     after = client.get("/api/pipelines").json()
-    assert {row["jira_id"] for row in after} == set(TICKETS) | {"CNV-6"}
+    assert {row["jira_id"] for row in after} == set(TICKETS) | {"PROJ-6"}
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +179,8 @@ def test_cached_is_single_flight(monkeypatch):
 def test_project_states_shared_across_metrics_routes(outputs, reads):
     assert client.get("/api/metrics/roi").status_code == 200
     reads.clear()
-    assert client.get("/api/metrics/confidence").status_code == 200
-    assert reads == [], "confidence repeated roi's per-ticket state reads"
+    assert client.get("/api/metrics/gaps").status_code == 200
+    assert reads == [], "gaps repeated roi's per-ticket state reads"
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +200,9 @@ def trends(outputs, monkeypatch):
 def test_trend_snapshot_write_keeps_the_metrics_cache(trends):
     ui._metrics_cache["unrelated-key"] = (time.time(), {"kept": True})
 
-    ui._append_trend_snapshot("cnv", {"time_saved_hours": 1}, pipelines=5, completed=3)
+    ui._append_trend_snapshot("example", {"time_saved_hours": 1}, pipelines=5, completed=3)
 
-    assert (ui._TRENDS_DIR / "cnv.yaml").is_file(), "the snapshot was not written"
+    assert (ui._TRENDS_DIR / "example.yaml").is_file(), "the snapshot was not written"
     assert "unrelated-key" in ui._metrics_cache, \
         "_append_trend_snapshot cleared _metrics_cache (PERF-01-L2 regression)"
 
@@ -211,7 +210,7 @@ def test_trend_snapshot_write_keeps_the_metrics_cache(trends):
 def test_other_writes_still_invalidate(trends):
     """The opt-out is scoped to trend snapshots — nothing else loses it."""
     ui._metrics_cache["unrelated-key"] = (time.time(), {"kept": True})
-    ui._atomic_yaml_update(_state_path(trends, "CNV-77"), lambda _d: {"ticket_id": "CNV-77"})
+    ui._atomic_yaml_update(_state_path(trends, "PROJ-77"), lambda _d: {"ticket_id": "PROJ-77"})
     assert "unrelated-key" not in ui._metrics_cache
 
 

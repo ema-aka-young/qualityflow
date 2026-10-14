@@ -36,12 +36,19 @@ fetched template's format — it represents the team's current standard.
 
 ## Document Structure
 
-**When `repo_rules.stp_template` is available:** Follow the fetched template's exact structure,
-section ordering, and formatting (tables vs checkboxes). The fetched template is the authority.
-Strip every `<!-- ... -->` comment and every example item from it — they are
-guidance for the author, and upstream review rejects STPs that keep them.
+**When the team has its own template** (`repo_rules.stp_template`, or
+`{project_context.config_dir}/templates/stp/stp-template.md`): follow its exact structure,
+section ordering, labels and formatting (tables vs checkboxes). That template is the authority,
+and output-validator checks the STP against it: its sections, block labels, fixed item labels,
+and the sub-fields its example items carry. The bundled structure below does not apply.
 
-**When using a local fallback:** The STP MUST contain sections in this EXACT order:
+Whichever template is used, strip every `<!-- ... -->` comment and replace every example item
+(a bracketed label such as `- **[Known Limitation]**`, or a `- **Risk:** [The risk]` entry)
+with real items that keep its sub-fields, or with the block's "None" line. Example items are
+guidance for the author, and reviewers reject STPs that keep them.
+
+**When using the bundled template** (`templates/stp-template.md`, the last resort): the STP
+MUST contain sections in this EXACT order:
 
 ```
 1. Document Header: `{project_context.stp_header}` (from project config)
@@ -93,7 +100,7 @@ template's italic prompt lines beneath it:
 ```markdown
 - [x] **Review Requirements**
   - *List the key D/S requirements reviewed:*
-    - Incremental backup of stopped VMs via the existing backup API (feature gate)
+    - Incremental backup of stopped resources via the existing backup API (feature gate)
     - Backup status reports offline mode
 ```
 
@@ -109,23 +116,25 @@ answered; leave `[ ]` only with a stated reason under it.
 - **Feature Maturity:**
   - DP: N/A
   - TP: N/A
-  - GA: CNV v5.1.0
+  - GA: v5.1.0
 ```
 
 Each value is a version or `N/A`. When Jira does not settle it (fix version and
 target version disagree, no maturity label), write the most likely value from
-the fix version followed by `[confirm]` — e.g. `GA: CNV v5.1.0 [confirm]` — and
+the fix version followed by `[confirm]` — e.g. `GA: v5.1.0 [confirm]` — and
 record the conflict once as an Entry Criteria item. Never nest maturity under
 another field and never explain it in prose here.
 
 ### Section I.2 Known Limitations
 
 Confirmed product constraints only (not test constraints — those are Test
-Limitations in II.1; not scope decisions — those are Out of Scope):
+Limitations in II.1; not scope decisions — those are Out of Scope). Each item
+has one home among Known Limitations, Out of Scope, Test Limitations and
+Risks; the others only point to it ("see Known Limitations"):
 
 ```markdown
-- **Only one offline incremental backup between VM starts**
-  - A second incremental while the VM stays stopped is rejected
+- **Only one offline incremental backup between resource starts**
+  - A second incremental while the resource stays stopped is rejected
   - *Sign-off:* [Name/Date]
 ```
 
@@ -145,7 +154,7 @@ prompt lines with answers beneath.
    outcome — see scenario-builder "Goals and scenarios are not duplicated".
 3. **Out of Scope** — each item:
    ```markdown
-   - **Running VM backup scenarios**
+   - **Running resource backup scenarios**
      - *Rationale:* Covered by the existing CBT STP
      - *PM/Lead Agreement:* [Name/Date]
    ```
@@ -200,6 +209,8 @@ The upstream template does not include a Related GitHub Pull Requests table.
 Do not add this section.
 
 ## Required Structure Counts
+
+These are the bundled template's; a team's own template sets its own.
 
 | Section | Format | Required Items |
 |:--------|:-------|:---------------|
@@ -403,7 +414,7 @@ All STP content must be written from the **user/QE perspective**, not the develo
 
 - **Replace** API field names, CRD spec fields, and internal struct names with user-observable descriptions
 - **Replace** internal component references (controller, reconciler, handler) with feature-level behavior descriptions
-- **Acceptance criteria** must describe user-observable outcomes ("VM starts successfully") not internal behavior ("controller reconciles resource status")
+- **Acceptance criteria** must describe user-observable outcomes ("Resource starts successfully") not internal behavior ("controller reconciles resource status")
 - If `project_context.review_rules.stp_rules.abstraction` is available, use `internal_to_user_mappings` for project-specific translations
 
 ### Regression Scenarios

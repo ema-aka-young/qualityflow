@@ -44,6 +44,33 @@ def test_image_installs_the_claude_cli_and_deploys_qf_resources():
     assert "pipeline_runner.py" in text  # ui.py's `from pipeline_runner import run_phase` needs it on disk
 
 
+def test_image_ships_lsp_for_claude_and_codex_runs():
+    """lsp_analysis defaults to true, but the image had no language server and
+    no LSP plugin, so every dashboard run fell back to grep. Claude runs get a
+    fresh CLAUDE_CONFIG_DIR, so the plugins are installed into a template the
+    runner copies in (a seed dir and repo-scoped enabledPlugins both left 0 LSP
+    servers). Codex gets LSP through mcp-language-server. QF_REPOS_DIR makes
+    the pod clone the team repos those servers analyze."""
+    text = (ROOT / "Containerfile").read_text()
+    assert 'pyright@${PYRIGHT_VERSION}' in text
+    assert 'golang.org/x/tools/gopls@${GOPLS_VERSION}' in text and "golang" in text
+    # Built from its tag with QualityFlow's patch (no pre-open, exit with the server).
+    assert '--branch "${MCP_LANGUAGE_SERVER_VERSION}"' in text
+    assert "COPY deploy/mcp-language-server.patch" in text and "apply /tmp/mls.patch" in text
+    patch = (ROOT / "deploy" / "mcp-language-server.patch").read_text()
+    assert 'os.Getenv("MCP_LSP_PRELOAD") != "1"' in patch and "os.Exit(1)" in patch
+    assert "claude plugin install gopls-lsp@claude-plugins-official" in text
+    assert "claude plugin install pyright-lsp@claude-plugins-official" in text
+    assert "QF_CLAUDE_CONFIG_TEMPLATE=/opt/claude-config" in text
+    assert "QF_REPOS_DIR=" in text
+    assert 'ARG LSP_EXTRA_LANGUAGES="typescript java c rust"' in text
+    for plugin in ("typescript-lsp", "jdtls-lsp", "clangd-lsp", "rust-analyzer-lsp"):
+        assert f"p={plugin} " in text
+    for server in ("typescript-language-server@", "clang-tools-extra", "java-21-openjdk-headless",
+                   "/usr/local/bin/jdtls", "/usr/local/bin/rust-analyzer", "sha256sum -c"):
+        assert server in text
+
+
 def test_image_installs_the_pinned_codex_cli_and_project_config():
     text = (ROOT / "Containerfile").read_text()
     assert "@openai/codex@${CODEX_CLI_VERSION}" in text
@@ -108,3 +135,24 @@ def test_containerfile_never_bakes_a_literal_token():
     text = (ROOT / "Containerfile").read_text()
     token_pattern = re.compile(r"ATATT|ghp_|ghs_|key_[A-Za-z0-9]{20,}|AIza")
     assert not token_pattern.search(text)
+
+
+def test_image_installs_a_pinned_verified_rtk_and_wires_it_for_claude_and_codex():
+    """RTK compresses shell output for pipeline runs. The binary is a pinned
+    release, checked against a pinned sha256 per arch; Claude runs get the
+    hook through /app/.claude (their CLAUDE_CONFIG_DIR is empty), Codex runs
+    an AGENTS.md instruction (rtk has no Codex hook)."""
+    import re as _re
+    text = (ROOT / "Containerfile").read_text()
+    assert "ARG RTK_VERSION=0.42.4" in text
+    assert "releases/download/v${RTK_VERSION}/rtk-${RTK_TARGET}.tar.gz" in text
+    assert _re.search(r"ARG RTK_SHA256_X86_64=[0-9a-f]{64}\n", text)
+    # The static x86_64 build; the arm64 one needs a newer glibc than UBI9's.
+    assert "x86_64-unknown-linux-musl" in text and "aarch64-unknown-linux-gnu" not in text
+    assert "if command -v rtk >/dev/null; then python3" in text
+    assert 'sha256sum -c -' in text
+    assert "install -m 0755 /tmp/rtk/rtk /usr/local/bin/rtk" in text
+    assert '"command": "rtk hook claude"' in text and "/app/.claude/settings.json" in text
+    assert "> /app/AGENTS.md" in text
+    # After deploy.py, which creates /app/.claude.
+    assert text.index("deploy.py --target both") < text.index("\"command\": \"rtk hook claude\"")

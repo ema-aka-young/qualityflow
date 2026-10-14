@@ -36,6 +36,17 @@ Target = Literal["claude", "cursor", "codex", "both", "all"]
 # the next run knows which files it is allowed to prune.
 MANIFEST_NAME = ".qf-deployed.json"
 
+# Claude Code's LSP tool only exists once a code-intelligence plugin is enabled
+# (code.claude.com/docs/en/plugins/code-intelligence). Both are relative-path
+# entries in the official marketplace, so an enabledPlugins entry is enough:
+# Claude Code registers claude-plugins-official from it and loads the plugin
+# from the marketplace copy — no `claude plugin install` step. The language
+# server binaries (gopls, pyright-langserver) are installed separately.
+LSP_PLUGINS = ("gopls-lsp@claude-plugins-official", "pyright-lsp@claude-plugins-official")
+# ponytail: ENABLE_LSP_TOOL is not in the public docs, but the CLI reads it and
+# earlier builds gated the LSP tool behind it; setting it is harmless otherwise.
+LSP_ENV = {"ENABLE_LSP_TOOL": "1"}
+
 
 def get_claude_paths(scope: Scope, project_path: Path | None) -> dict[str, Path]:
     """Return dict of Claude Code target paths."""
@@ -97,6 +108,50 @@ def md_agent_to_toml(src: Path) -> str:
     }
     # A JSON string (ensure_ascii=False) is a valid TOML basic string.
     return "".join(f"{k} = {json.dumps(v, ensure_ascii=False)}\n" for k, v in fields.items())
+
+
+def md_command_to_skill(src: Path) -> str:
+    """Render a slash-command .md as a Codex SKILL.md. Codex has deprecated
+    custom prompts: CLI 0.160 lists none of ~/.codex/prompts under `/` or
+    `/prompts:`, while `$name` lists skills — so each command is also a skill
+    (`$stp-builder PROJ-123`), at user and project scope alike. Skills get no
+    $ARGUMENTS substitution; the body says where the arguments are."""
+    text = src.read_text()
+    front, body = "", text
+    if text.startswith("---\n") and text.count("---\n") >= 2:
+        _, front, body = text.split("---\n", 2)
+    meta = dict(
+        (k.strip(), v.strip())
+        for k, _, v in (line.partition(":") for line in front.splitlines())
+        if k and not k[0].isspace()
+    )
+    name = src.stem  # = the skill's directory name, which Codex matches it by
+    hint = meta.get("argument-hint", "")
+    head = (f"$ARGUMENTS below means the text the user wrote after `${name}`"
+            + (f" (expected: `{hint}`)" if hint else "") + ".\n\n")
+    return ("---\n"
+            f"name: {json.dumps(name)}\n"
+            f"description: {json.dumps(meta.get('description', ''), ensure_ascii=False)}\n"
+            "---\n\n" + head + body.lstrip("\n"))
+
+
+def copy_codex_command_skills(
+    files: list[Path], skills_dir: Path, dry_run: bool, taken: set[str]
+) -> list[tuple[Path, Path]]:
+    """Write each command as skills_dir/{stem}/SKILL.md. A skill of the same
+    name from skills/ wins: the command is not written over it."""
+    copied = []
+    for src_file in files:
+        dest = skills_dir / src_file.stem / "SKILL.md"
+        if src_file.stem in taken:
+            click.secho(f"  Warning: command {src_file.stem} not written as a Codex skill "
+                        "(a skill of that name exists)", fg="yellow")
+            continue
+        if not dry_run:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(md_command_to_skill(src_file))
+        copied.append((src_file, dest))
+    return copied
 
 
 def copy_codex_agents(
@@ -184,11 +239,13 @@ def copy_skill_directory(
             shutil.rmtree(dest_skill_dir)
         # Copy entire directory tree; symlinks=True keeps links as links rather
         # than dereferencing them into copies of whatever they point at.
-        shutil.copytree(skill_dir, dest_skill_dir, symlinks=True)
+        # Bytecode caches from local test runs are not part of the skill.
+        shutil.copytree(skill_dir, dest_skill_dir, symlinks=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
     # Collect all files for reporting
     for src_file in skill_dir.rglob("*"):
-        if src_file.is_file():
+        if src_file.is_file() and "__pycache__" not in src_file.parts and src_file.suffix != ".pyc":
             rel_path = src_file.relative_to(skill_dir)
             dest_file = dest_skill_dir / rel_path
             copied.append((src_file, dest_file))
@@ -264,6 +321,35 @@ def prune_stale_files(
     return pruned, not_pruned
 
 
+def enable_lsp_plugins(base: Path, dry_run: bool) -> tuple[Path, list[str]]:
+    """Merge LSP_PLUGINS and LSP_ENV into base/settings.json (user scope:
+    ~/.claude/settings.json; project scope: .claude/settings.json, so the
+    dashboard image and every collaborator get it). Adds missing keys only —
+    a key the user already set, including `false` to opt out, is never
+    changed, so re-running is a no-op. Returns (path, keys added)."""
+    path = base / "settings.json"
+    try:
+        settings = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError) as e:
+        click.secho(f"  Warning: {path} unreadable ({e}); LSP plugins not enabled.", fg="yellow")
+        return path, []
+    plugins = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else None
+    env = settings.get("env", {}) if isinstance(settings, dict) else None
+    if not isinstance(plugins, dict) or not isinstance(env, dict):
+        click.secho(f"  Warning: {path} has an unexpected shape; LSP plugins not enabled.", fg="yellow")
+        return path, []
+    added = [p for p in LSP_PLUGINS if p not in plugins]
+    added += [f"env.{k}" for k in LSP_ENV if k not in env]
+    if added and not dry_run:
+        plugins.update({p: True for p in LSP_PLUGINS if p not in plugins})
+        env.update({k: v for k, v in LSP_ENV.items() if k not in env})
+        settings["enabledPlugins"], settings["env"] = plugins, env
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(settings, indent=2) + "\n")
+        os.replace(tmp, path)
+    return path, added
+
+
 def deploy_resources(
     source: dict[str, list[Path]],
     paths: dict[str, Path],
@@ -285,14 +371,20 @@ def deploy_resources(
     # Copy commands
     if source["commands"] and paths["commands"] is None:
         click.secho(
-            f"  Note ({target_name}): commands skipped — custom prompts exist only "
-            "at user scope (~/.codex/prompts); use --scope user.",
+            f"  Note ({target_name}): no custom prompts at project scope (they exist only "
+            "in ~/.codex/prompts); the commands are deployed as skills instead ($name).",
             fg="yellow",
         )
     elif source["commands"]:
         results["commands"] = copy_flat_files(
             source["commands"], paths["commands"], dry_run
         )
+
+    # Codex: commands as skills too (custom prompts no longer show in the CLI)
+    if target_name == "Codex" and source["commands"]:
+        results["skills"].extend(
+            copy_codex_command_skills(source["commands"], paths["skills"], dry_run,
+                                      {d.name for d in source["skills"]}))
 
     # Copy skills
     for skill_dir in source["skills"]:
@@ -493,9 +585,22 @@ def main(
         ) = prune_stale_files(all_results[target_name], base, dry_run)
         if not dry_run:
             write_manifest(base, all_results[target_name], source)
+        if flag == "claude":
+            lsp = enable_lsp_plugins(base, dry_run)
 
     # Print summary
     print_summary(all_results, dry_run)
+
+    if "claude" in selected:
+        click.echo()
+        click.secho("  LSP (code intelligence):", fg="cyan", bold=True)
+        lsp_path, lsp_added = lsp
+        if lsp_added:
+            verb = "Would enable" if dry_run else "Enabled"
+            click.secho(f"    {verb} in {lsp_path}: {', '.join(lsp_added)}", fg="green")
+            click.echo("    Needs gopls / pyright-langserver on PATH (uv run getting-started.py checks).")
+        else:
+            click.echo(f"    Already set in {lsp_path} (nothing to do)")
 
     # Prune report — stale agent/command .md files with no matching source
     click.echo()

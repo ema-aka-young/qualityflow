@@ -129,9 +129,9 @@ scenario:
   coverage_status: EXISTING_COVERAGE
   test_scenarios: []
   covered_by:
-    - test_function: TestCPUHotplug_Success
+    - test_function: TestCPUResize_Success
       test_file: pkg/compute/cpu_test.go
-      behavior_tested: "CPU hot-add succeeds for running VM"
+      behavior_tested: "In-place CPU resize succeeds for running workload"
 ```
 
 **PARTIAL_COVERAGE output:** Generate scenarios only for uncovered gaps. Include
@@ -277,19 +277,24 @@ into a single scenario that states the full observable sequence:
 
 | Duplicates | Merged |
 |:-----------|:-------|
-| Verify guest startup waits until pull request finalization / Verify guest starts after pull finalization and cleanup | Verify VM start is blocked while a pull backup is in progress and succeeds once the backup request is deleted |
+| Verify workload startup waits until pull request finalization / Verify workload starts after pull finalization and cleanup | Verify workload start is blocked while a pull backup is in progress and succeeds once the backup request is deleted |
 | Verify request is rejected when feature gate is off / Verify rejection message names the feature gate | Verify request is rejected with a feature-gate error when the gate is off |
 
 Keep them separate only when they need different setup or conditions (gate on
-vs gate off, Linux vs Windows guest) — the upstream granularity rule.
+vs gate off, Linux vs Windows nodes) — the upstream granularity rule.
 
-**Mode variants** (push/pull, block/filesystem) are separate scenarios when the
-behavior or the observable differs by mode. Word them in parallel ("... in push
-mode" / "... in pull mode") and place them next to each other.
+**Mode variants** (push/pull, block/filesystem, one OS or protocol and
+another) are **one scenario** when the expected result is the same in every
+mode: name the modes in it ("... in push and pull modes"); the STD
+parametrizes it. Split only when the steps or the expected result differ by
+mode, and then each scenario says what differs. A pilot plan doubled 26
+behaviours into 50 rows this way, and its reviewers read every pair twice.
 
 **Goals** — one goal per distinct user outcome. A goal that applies to several
 modes names them once ("... in push and pull modes"); never one goal per mode.
-A goal is one sentence: `As a <role>, verify <observable outcome>`.
+A goal is one sentence: `As a <role>, verify <observable outcome>`. Goals are
+outcomes, so there are fewer of them than scenarios: a goals list that maps
+one-to-one onto the scenarios restates Section III — merge it.
 
 **Vocabulary** — use the feature's own user-facing terms (the ones in the Jira
 user stories and the enhancement doc) and the same term every time. Do not

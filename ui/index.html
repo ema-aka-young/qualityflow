@@ -1027,7 +1027,7 @@ EOF</code></pre>
                                 </div>
                                 <div>
                                     <label class="text-xs text-qf-muted block mb-1">Repository URL</label>
-                                    <input id="onboardRepoUrl" type="text" placeholder="https://github.com/kubevirt/kubevirt  or  kubevirt/kubevirt" class="w-full px-3 py-2 bg-qf-bg border border-qf-border rounded-lg text-sm text-qf-text placeholder:text-qf-muted/40 focus:outline-none focus:border-qf-accent/50" />
+                                    <input id="onboardRepoUrl" type="text" placeholder="https://github.com/my-org/my-repo  or  my-org/my-repo" class="w-full px-3 py-2 bg-qf-bg border border-qf-border rounded-lg text-sm text-qf-text placeholder:text-qf-muted/40 focus:outline-none focus:border-qf-accent/50" />
                                 </div>
                                 <div id="onboardDetect" class="hidden">
                                     <div class="flex items-center gap-2 p-3 bg-qf-bg rounded-lg border border-qf-border">
@@ -1129,7 +1129,7 @@ EOF</code></pre>
                 <!-- Runtime -->
                 <div>
                     <label class="block text-sm font-medium mb-1.5">Runtime</label>
-                    <p class="text-xs text-qf-muted mb-2">Which backend runs your STP/STD/tests phases. Claude via Vertex is the team default; Cursor and Codex use your own API key below. Takes effect immediately &mdash; no refresh.</p>
+                    <p class="text-xs text-qf-muted mb-2">Which backend runs your STP/STD/tests phases. Codex is the default unless this dashboard sets another; Codex and Cursor use your own API key below, Claude your Vertex credential. Takes effect immediately &mdash; no refresh.</p>
                     <select id="settingsRuntime" onchange="persistRuntimeSettingsLive()" class="w-full bg-qf-card border border-qf-border text-qf-text text-sm rounded-md px-3 py-2 focus:outline-none focus:border-qf-accent">
                         <option value="claude">Claude (via Vertex)</option>
                         <option value="cursor">Cursor</option>
@@ -3787,7 +3787,7 @@ EOF</code></pre>
     var _productCovProject = '';
 
     async function loadProductCoverage() {
-        // Detect project from current filter or default to cnv
+        // Detect project from the current filter
         var projectId = _productCovProject || _getSelectedProject();
         try {
             var config = await api('/api/coverage/product/config/' + encodeURIComponent(projectId));
@@ -3878,7 +3878,7 @@ EOF</code></pre>
             icon.className = 'w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold bg-purple-500/20 text-purple-400';
             icon.textContent = '\u25CB';
             title.textContent = 'CoverPort Not Yet Configured';
-            desc.textContent = 'Product coverage requires CoverPort instrumentation in kubevirt binaries';
+            desc.textContent = 'Product coverage requires CoverPort instrumentation in the product binaries';
         }
 
         // Step statuses
@@ -4365,7 +4365,7 @@ EOF</code></pre>
 
     async function detectOnboardLanguage() {
         var parsed = parseRepoInput(document.getElementById('onboardRepoUrl').value);
-        if (!parsed) { alert('Enter a GitHub repo URL (e.g. https://github.com/kubevirt/kubevirt)'); return; }
+        if (!parsed) { alert('Enter a GitHub repo URL (e.g. https://github.com/my-org/my-repo)'); return; }
         _onboardParsed = parsed;
         var org = parsed.org;
         var repo = parsed.repo;
@@ -4850,7 +4850,7 @@ EOF</code></pre>
             actionsHtml +=
                 '<button id="topRunBtn" onclick="runPhase(\'' + escapeHtml(jiraId) + '\', \'' + escapeHtml(nextPhase) + '\')" ' +
                 'class="bg-qf-accent hover:bg-blue-500 text-white text-sm px-4 py-1.5 rounded-md transition-colors flex items-center gap-2" ' +
-                'title="Run this phase using ' + runtimeLabel() + '">' +
+                'title="Run this phase using ' + runtimeLabel() + (nextPhase === 'codegen' && codegenExperimentalChip(phases) ? '. ' + escapeHtml(CODEGEN_EXPERIMENTAL_NOTE) : '') + '">' +
                 '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>' +
                 '<span class="text-xs font-medium">' + (nextIsRetry ? 'Retry ' : 'Run ') + escapeHtml(PHASE_META[nextPhase].label) + '</span>' +
                 '</button>';
@@ -4884,8 +4884,16 @@ EOF</code></pre>
                     '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>' +
                     '<span>' + closeLabel + '</span></button>';
             }
-            // A closed PR doesn't block a new one (the server replaces it).
+            // A closed PR doesn't block a new one (the server replaces it); an
+            // open one is updated in place with the current documents.
             if (prSt === 'closed' && hasArtifacts) actionsHtml += pushBtnHtml;
+            if (prSt === 'open' && hasArtifacts) {
+                actionsHtml += pushBtnHtml
+                    .replace('pushToPR(\'' + escapeHtml(jiraId) + '\')',
+                             'pushToPR(\'' + escapeHtml(jiraId) + '\', ' +
+                             escapeHtml(JSON.stringify(prInfo.stp_folder ? { stp_folder: prInfo.stp_folder } : {})) + ')')
+                    .replace('<span>Push to PR</span>', '<span>Update PR</span>');
+            }
         } else if (hasArtifacts) {
             actionsHtml += pushBtnHtml;
         }
@@ -4961,6 +4969,7 @@ EOF</code></pre>
                 '<div ' + clickHandler + ' class="phase-dot w-10 h-10 rounded-full ' + si.cssClass + ' ' + cursorClass + nextRing + ' flex items-center justify-center text-sm font-bold" title="' + escapeHtml(meta.label) + ': ' + escapeHtml(status) + ' — click for details">' +
                 si.icon + '</div>' +
                 '<span class="text-xs text-qf-muted">' + escapeHtml(meta.short) + '</span>' +
+                (name === 'codegen' ? codegenExperimentalChip(phases) + (status === 'completed' ? codegenVerificationHtml(phase) : '') : '') +
                 verdictSpan + '</div>' + connector;
         }).join('');
 
@@ -4983,7 +4992,10 @@ EOF</code></pre>
                     var rtName = runtimeLabel();
                     return nextIsRunning ? rtName + ' is working on this phase' : nextIsRetry ? 'Last run did not finish — run it again with ' + rtName : 'Click to run this phase with ' + rtName;
                 })() +
-                '</div></div></div>' +
+                '</div>' +
+                (nextPhase === 'codegen' && codegenExperimentalChip(phases)
+                    ? '<div class="text-xs text-qf-orange">' + escapeHtml(CODEGEN_EXPERIMENTAL_NOTE) + '</div>' : '') +
+                '</div></div>' +
                 '<div class="flex items-center gap-2 flex-shrink-0">' +
                 (nextIsRunning ? '' : _modelPickerHtml()) +
                 (nextIsRunning ?
@@ -5107,9 +5119,12 @@ EOF</code></pre>
             var spend = _phaseSpend(phase);
             if (spend.runs > 1) costText += '<div class="text-[10px] text-qf-muted" title="Latest run above; this is every recorded run of this phase">$' + spend.total.toFixed(2) + ' · ' + spend.runs + ' runs</div>';
             return '<tr class="border-b border-qf-border last:border-0">' +
-                '<td class="px-4 py-2 font-medium">' + escapeHtml(meta.label) + '</td>' +
+                '<td class="px-4 py-2 font-medium">' + escapeHtml(meta.label) + (name === 'codegen' ? ' ' + codegenExperimentalChip(phases) : '') + '</td>' +
                 '<td class="px-4 py-2"><span class="' + statusTextClass(status) + '">' + escapeHtml(status) + '</span></td>' +
-                '<td class="px-4 py-2">' + escapeHtml(phase.verdict || '-') + '</td>' +
+                '<td class="px-4 py-2">' + (name === 'codegen' && phase.verification
+                    ? escapeHtml('verification: ' + phase.verification) + (phase.verification_reason
+                        ? '<div class="text-[10px] text-qf-muted">' + escapeHtml(phase.verification_reason) + '</div>' : '')
+                    : escapeHtml(phase.verdict || '-')) + '</td>' +
                 '<td class="px-4 py-2 mono text-xs">' + escapeHtml(findingsStr) + '</td>' +
                 '<td class="px-4 py-2 text-xs text-qf-muted max-w-[280px]">' + outputCell + '</td>' +
                 '<td class="px-4 py-2 text-xs text-qf-text tabular-nums">' + costText + '</td>' +
@@ -5141,7 +5156,14 @@ EOF</code></pre>
                 '<a href="' + escapeHtml(prInfo.url) + '" target="_blank" rel="noopener" class="text-qf-purple hover:text-qf-accent text-sm font-medium flex items-center gap-1">' +
                 'Open PR <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg></a>' +
                 '</div>' +
-                '</div></div>';
+                '</div>' +
+                '<div id="prReviewRow" class="mt-2 flex flex-wrap items-center gap-2 text-xs text-qf-muted">' +
+                '<button onclick="askForReview(\'' + escapeHtml(jiraId) + '\')" class="text-qf-accent hover:underline">Ask for review</button>' +
+                '<span class="text-qf-muted/70">·</span>' +
+                '<button onclick="pullPrComments(\'' + escapeHtml(jiraId) + '\')" class="text-qf-accent hover:underline">Pull PR comments</button>' +
+                '<span id="prReviewers"></span></div>' +
+                '</div>';
+            setTimeout(function() { _loadPrReviewers(jiraId); }, 0);
         }
 
         // Jira ticket info card
@@ -5173,11 +5195,22 @@ EOF</code></pre>
                 '</a></div></div>';
         }
 
+        // The team's own STP, pulled in from its design-docs repo instead of generated.
+        var src = (detail && detail.stp_source) || null;
+        var srcHtml = src && /^https:\/\//.test(src.url || '')
+            ? '<div class="mt-3 text-xs text-qf-muted">STP: the team\'s own, from ' +
+              '<a href="' + escapeHtml(src.url) + '" target="_blank" rel="noopener" class="text-qf-accent hover:underline">' +
+              escapeHtml((src.repo || '') + '/' + (src.path || '')) + '</a>' +
+              (src.merged ? ' (merged)' : src.pull_request ? ' (<a href="' + escapeHtml(src.pull_request) +
+              '" target="_blank" rel="noopener" class="text-qf-accent hover:underline">open PR</a>)' : '') + '</div>'
+            : '';
+
         setHtml(el,
             jiraCardHtml +
             '<div class="mb-8">' +
                 '<h3 class="text-sm font-semibold text-qf-muted uppercase tracking-wider mb-4">Pipeline Progress</h3>' +
                 '<div id="pipelineDots" class="flex items-center gap-2 flex-wrap">' + phaseHtml + '</div>' +
+                srcHtml +
                 caveatsHtml +
                 autoApprovedHtml +
                 nextStepHtml +
@@ -5444,6 +5477,7 @@ EOF</code></pre>
                     ? '<button onclick="' + call('runPhase', '_review') + '" class="bg-qf-yellow/10 border border-qf-yellow text-qf-yellow font-bold px-2 py-0.5 rounded">Re-run review</button>'
                     : link(call('runPhase', '_review'), 'Re-run review'),
                 link(call('showArtifactDiff', ''), 'What changed'),
+                editable ? link('addReviewNote(\'' + jid + '\', \'' + name + '\')', 'Add note') : '',
                 artLink(function(a) { return a.type === name + '_review'; }, 'View review'),
                 phase.refined_ts ? artLink(function(a) { return a.type === name + '_refinement_log'; }, 'View refinement log') : ''
             ].filter(Boolean);
@@ -5637,7 +5671,7 @@ EOF</code></pre>
     // Folder taxonomy: group flat artifacts by pipeline stage so the detail
     // view reads as organized folders instead of one long pile of cards.
     var ARTIFACT_FOLDERS = [
-        { key: 'plan',  label: 'Test Plan',        icon: '\uD83D\uDCC4', types: ['stp', 'stp_review'] },
+        { key: 'plan',  label: 'Test Plan',        icon: '\uD83D\uDCC4', types: ['stp', 'stp_review', 'regression_analysis'] },
         { key: 'desc',  label: 'Test Description', icon: '\uD83D\uDCCB', types: ['std', 'std_review'] },
         { key: 'stubs', label: 'Test Stubs',       icon: '\uD83D\uDCDD', types: ['go_stub', 'python_stub'] },
         { key: 'tests', label: 'Generated Tests',  icon: '\uD83E\uDDEA', types: ['go_test', 'python_test'], collapsed: true },
@@ -5743,6 +5777,7 @@ EOF</code></pre>
                 '<div id="artifactRaw" class="bg-qf-card border border-qf-border rounded-lg p-6 hidden">' +
                 '<pre class="text-sm text-qf-text whitespace-pre-wrap mono">' + escapeHtml(data.raw) + '</pre></div>'
             );
+            if (type === 'stp' || type === 'std') _markableScenarios(jiraId, type);
             // Compute and display stats
             var raw = data.raw || '';
             var lines = raw.split('\n').length;
@@ -5755,6 +5790,88 @@ EOF</code></pre>
             console.error('Failed to load artifact:', e);
             showToast('Failed to load artifact: ' + e.message, 'error');
         }
+    }
+
+    // Keep/remove per scenario. A reviewer marks the scenarios to drop while
+    // reading, instead of approving or rejecting 40KB in one go; the marks
+    // become the notes of a Request changes run (kept per ticket in this
+    // browser until then).
+    // Marks belong to one version of the document: a refine renumbers the
+    // scenarios, so marks saved against another version are dropped.
+    function _docHash(text) {
+        var h = 0;
+        for (var i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) | 0;
+        return String(h);
+    }
+    function _scenarioMarks(jiraId, type) {
+        try {
+            var saved = JSON.parse(_lsGet('qf_remove_' + type + '_' + jiraId) || '{}');
+            return saved.doc === _docHash(currentArtifactRaw || '') ? (saved.marks || {}) : {};
+        } catch (_) { return {}; }
+    }
+    function _markableScenarios(jiraId, type) {
+        var root = document.getElementById('artifactRendered');
+        if (!root) return;
+        var ph = ((pipelines || []).filter(function(p) { return p.jira_id === jiraId; })[0] || {}).phases || {};
+        if ((ph[type] || {}).status !== 'awaiting_approval') return;  // nothing to request changes on
+        var re = /\bTS-(\d+)\b/;
+        var cells = Array.prototype.filter.call(root.querySelectorAll('li, td'), function(el) {
+            return re.test(el.textContent) && !Array.prototype.some.call(
+                el.querySelectorAll('li, td'), function(k) { return re.test(k.textContent); });
+        });
+        if (!cells.length) return;
+        var bar = document.createElement('div');
+        bar.id = 'scenarioMarkBar';
+        bar.className = 'mb-3 flex items-center gap-3 bg-qf-card border border-qf-border rounded-lg px-3 py-2 text-xs text-qf-muted';
+        bar.style.cssText = 'position:sticky;top:0;z-index:5';  // stays in view while reading a long plan
+        root.parentNode.insertBefore(bar, root);
+        var marks = _scenarioMarks(jiraId, type);
+        function paintBar() {
+            var ids = Object.keys(marks).sort(function(a, b) { return +a.slice(3) - +b.slice(3); });
+            setHtml(bar, ids.length
+                ? '<span class="text-qf-text">' + ids.length + ' scenario' + (ids.length !== 1 ? 's' : '') + ' marked to remove</span>' +
+                  '<span class="flex-1"></span><button class="text-xs bg-qf-accent/20 border border-qf-accent/30 text-qf-accent font-bold px-2.5 py-1 rounded" id="scenarioMarkSend">Request changes</button>'
+                : 'Mark a scenario to remove it — the marks go into a Request changes run.');
+            var send = document.getElementById('scenarioMarkSend');
+            if (send) send.onclick = function() {
+                _rejectionComments[jiraId + '/' + type] = 'Remove these scenarios: ' + ids.map(function(id) {
+                    return id + (marks[id] ? ' (' + marks[id] + ')' : '');
+                }).join(', ') + '.';
+                requestChanges(jiraId, type);
+            };
+        }
+        cells.forEach(function(el) {
+            var id = 'TS-' + el.textContent.match(re)[1].padStart(2, '0');
+            var btn = document.createElement('button');
+            btn.className = 'ml-2 text-[10px] px-1.5 py-0.5 rounded border align-middle';
+            function paint() {
+                var on = marks.hasOwnProperty(id);
+                btn.textContent = on ? 'removed · undo' : 'remove';
+                btn.className = 'ml-2 text-[10px] px-1.5 py-0.5 rounded border align-middle ' +
+                    (on ? 'border-qf-red/50 text-qf-red' : 'border-qf-border text-qf-muted hover:text-qf-text');
+                el.style.opacity = on ? '0.45' : '';
+            }
+            function save() {
+                _lsSet('qf_remove_' + type + '_' + jiraId,
+                       JSON.stringify({ doc: _docHash(currentArtifactRaw || ''), marks: marks }));
+                paint(); paintBar();
+            }
+            btn.onclick = function(ev) {
+                ev.preventDefault();
+                if (marks.hasOwnProperty(id)) { delete marks[id]; save(); return; }
+                _showStyledPrompt({
+                    title: 'Remove ' + id,
+                    message: 'The scenario is dropped when you send the marks with Request changes.',
+                    placeholder: 'Optional: why? e.g. duplicates TS-04',
+                    maxLength: 200,
+                    confirmLabel: 'Mark to remove',
+                    onSubmit: function(text) { marks[id] = (text || '').trim(); save(); }
+                });
+            };
+            paint();
+            el.appendChild(btn);
+        });
+        paintBar();
     }
 
     function toggleRawView() {
@@ -5969,7 +6086,9 @@ EOF</code></pre>
                     ? ' <span class="text-[9px] font-medium px-1.5 py-0.5 rounded bg-qf-orange/10 border border-qf-orange/40 text-qf-orange" title="Link inferred, not explicit">inferred</span>'
                     : '';
                 var tests = sc.tests || [];
-                var testsHtml = tests.length === 0
+                var testsHtml = sc.link === 'stp'
+                    ? '<span class="text-[9px] font-medium px-1.5 py-0.5 rounded bg-qf-muted/10 border border-qf-border text-qf-muted">no STD yet</span>'
+                    : tests.length === 0
                     ? '<span class="text-[9px] font-medium px-1.5 py-0.5 rounded bg-qf-red/10 border border-qf-red/40 text-qf-red">no test</span>'
                     : tests.map(function(t) {
                         var docTag = t.marker === 'docstring'
@@ -6006,6 +6125,25 @@ EOF</code></pre>
             pending: 'text-qf-muted',
         };
         return map[status] || 'text-qf-muted';
+    }
+
+    var CODEGEN_EXPERIMENTAL_NOTE = 'Experimental: generated tests are only checked by collecting or compiling them in your tests repo checkout, never run.';
+    // Code generation is "experimental" until its tests pass the offline check
+    // in the team's tests repo checkout (state.py codegen `verification`:
+    // passed | failed | skipped). That check collects or compiles; it never runs a test.
+    function codegenVerificationHtml(phase) {
+        var v = (phase || {}).verification;
+        var s = { passed: ['text-qf-green', 'verified'], failed: ['text-qf-red', 'verify failed'],
+                  skipped: ['text-qf-orange', 'unverified'] }[v];
+        if (!s) return '';
+        var title = 'Collect/compile check in the tests repo checkout: ' + v +
+            (phase.verification_reason ? ' (' + phase.verification_reason + ')' : '') + '. No test was run.';
+        return '<span class="text-[10px] ' + s[0] + ' whitespace-nowrap" title="' + escapeHtml(title) + '">' + s[1] + '</span>';
+    }
+    function codegenExperimentalChip(phases) {
+        if ((((phases || {}).codegen) || {}).verification === 'passed') return '';
+        return '<span class="text-[10px] font-semibold px-1.5 rounded-full bg-qf-orange/10 border border-qf-orange/40 text-qf-orange" ' +
+            'title="' + escapeHtml(CODEGEN_EXPERIMENTAL_NOTE) + '">experimental</span>';
     }
 
     // Single source of truth for "what's the next actionable phase" — used by
@@ -6048,7 +6186,7 @@ EOF</code></pre>
     }
 
     // -----------------------------------------------------------------------
-    // Run Phase via Claude or Cursor (selected runtime, see getUserRuntime)
+    // Run Phase via Claude, Cursor or Codex (selected runtime, see getUserRuntime)
     // -----------------------------------------------------------------------
     var _runningPhases = {};
     var _phaseStartTime = {};
@@ -6058,10 +6196,14 @@ EOF</code></pre>
     // value = backend default (inherit the Claude session model, or the
     // configured Cursor/Codex default). Selection persists in localStorage, per-runtime so
     // switching runtimes doesn't clobber the other's saved choice.
+    // Runtime for a person who never picked one in Settings: the server's
+    // QF_RUNNER_DEFAULT_RUNTIME, sent as /api/models default_runtime.
+    var _defaultRuntime = 'codex';
     var _runnerModels = { claude: { default: '', models: [], labels: {} }, cursor: { default: '', models: [], labels: {}, env_key: false }, codex: { default: '', models: [], labels: {}, env_key: false } };
     async function loadRunnerModels() {
         try {
             var m = await api('/api/models');
+            if (_isRuntime(m.default_runtime)) _defaultRuntime = m.default_runtime;
             _runnerModels = {
                 claude: {
                     default: (m.claude && m.claude.default) || '',
@@ -6509,7 +6651,7 @@ EOF</code></pre>
         else _lsRemove('qf_api_key');
         // Persist the selected runtime explicitly so a stale/older localStorage
         // value never survives an explicit Save.
-        _lsSet('qf_runtime', runtime === 'cursor' || runtime === 'codex' ? runtime : 'claude');
+        _lsSet('qf_runtime', _isRuntime(runtime) ? runtime : _defaultRuntime);
         if (cursorApiKey) _lsSet('qf_cursor_api_key', cursorApiKey);
         else _lsRemove('qf_cursor_api_key');
         if (codexApiKey) _lsSet('qf_codex_api_key', codexApiKey);
@@ -6557,7 +6699,7 @@ EOF</code></pre>
         document.getElementById('settingsJiraToken').value = '';
         document.getElementById('settingsDisplayName').value = '';
         document.getElementById('settingsApiKey').value = '';
-        document.getElementById('settingsRuntime').value = 'claude';
+        document.getElementById('settingsRuntime').value = _defaultRuntime;
         document.getElementById('settingsCursorApiKey').value = '';
         document.getElementById('settingsCodexApiKey').value = '';
         updateTokenStatus();
@@ -6652,10 +6794,11 @@ EOF</code></pre>
     }
 
     // "claude" | "cursor" | "codex" only, any other stored value
-    // (unset, stale, corrupted) reads back as "claude".
+    // (unset, stale, corrupted) reads back as the server default.
+    function _isRuntime(r) { return r === 'claude' || r === 'cursor' || r === 'codex'; }
     function getUserRuntime() {
         var r = _lsGet('qf_runtime');
-        return r === 'cursor' || r === 'codex' ? r : 'claude';
+        return _isRuntime(r) ? r : _defaultRuntime;
     }
 
     function runtimeLabel() {
@@ -6684,7 +6827,7 @@ EOF</code></pre>
     function persistRuntimeSettingsLive() {
         var runtimeEl = document.getElementById('settingsRuntime');
         if (runtimeEl) {
-            _lsSet('qf_runtime', runtimeEl.value === 'cursor' || runtimeEl.value === 'codex' ? runtimeEl.value : 'claude');
+            _lsSet('qf_runtime', _isRuntime(runtimeEl.value) ? runtimeEl.value : _defaultRuntime);
         }
         persistCursorKeyLive();
         persistCodexKeyLive();
@@ -6785,7 +6928,7 @@ EOF</code></pre>
             }
         }
 
-        // A project with a design-docs repo (CNV) takes only the STP, into a
+        // A project with a design-docs repo takes only the STP, into a
         // stps/<folder>/ the user picks; generated tests go to the test repo.
         if (!extra) {
             var dest;
@@ -6829,7 +6972,11 @@ EOF</code></pre>
                 body: JSON.stringify(Object.assign({ github_token: userToken }, getUserJiraCreds(), extra || {}))
             });
 
-            if (result.pr && result.pr.url) {
+            if (result.skipped) showToast(result.skipped, 'info');
+            if (result.pr && result.pr.url && result.status === 'updated') {
+                showToast('PR #' + (result.pr.number || '') + ' updated with the current documents', 'success');
+                showPipelineDetail(jiraId);
+            } else if (result.pr && result.pr.url) {
                 showToast('PR #' + (result.pr.number || '') + ' created successfully', 'success');
                 // Replace button with PR link
                 var actionsEl = document.getElementById('contentActions');
@@ -6987,14 +7134,20 @@ EOF</code></pre>
     // fixes the review's critical+major findings plus the user's notes,
     // re-reviews, and returns the phase to awaiting_approval.
     var REFINE_FEEDBACK_MAX = 8000;  // server rejects longer with a 400
-    function requestChanges(jiraId, phase) {
+    async function requestChanges(jiraId, phase) {
         var label = PHASE_META[phase].label;
+        var queued = [];
+        try { queued = (await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/notes/' + phase)).notes || []; } catch (_) {}
+        var queuedText = queued.length
+            ? ' It also applies ' + queued.length + ' queued note' + (queued.length !== 1 ? 's' : '') + ' (from ' +
+              queued.map(function(n) { return n.who; }).filter(function(w, i, a) { return a.indexOf(w) === i; }).join(', ') + ').'
+            : '';
         var model = _selectedModel();
         var modelName = model ? (((_runnerModels[getUserRuntime()] || {}).labels || {})[model] || model) : 'default model';
         _showStyledPrompt({
             title: 'Request changes to the ' + label,
             message: 'QualityFlow will fix the review’s critical and major findings, apply your notes, and re-review — the ' +
-                label + ' comes back here for approval. Minor findings are left as-is.',
+                label + ' comes back here for approval. Minor findings are left as-is.' + queuedText,
             placeholder: 'Optional: what should change? e.g. TS-05 must cover start-after-cancel',
             defaultValue: _rejectionComments[jiraId + '/' + phase] || '',
             multiline: true,
@@ -7183,6 +7336,78 @@ EOF</code></pre>
     // -----------------------------------------------------------------------
     // Refresh PR Status
     // -----------------------------------------------------------------------
+    // Peer review on the ticket's PR — additive, never a gate.
+    async function _loadPrReviewers(jiraId) {
+        var el = document.getElementById('prReviewers');
+        if (!el) return;
+        try {
+            var r = await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/reviewers');
+            var states = { APPROVED: 'approved', CHANGES_REQUESTED: 'changes requested', COMMENTED: 'commented', DISMISSED: 'dismissed' };
+            var bits = (r.reviews || []).map(function(x) { return '@' + escapeHtml(x.login) + ' ' + (states[x.state] || x.state.toLowerCase()); })
+                .concat((r.requested || []).map(function(l) { return '@' + escapeHtml(l) + ' asked'; }));
+            setHtml(el, bits.length ? '<span class="text-qf-muted/70">·</span> Reviewers: ' + bits.join(', ') : '');
+        } catch (_) { /* the row keeps its two actions */ }
+    }
+
+    async function askForReview(jiraId) {
+        var r = {};
+        try { r = await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/reviewers'); } catch (_) {}
+        var sugg = (r.suggested || []).filter(function(p) { return (r.requested || []).indexOf(p.github) < 0; });
+        _showStyledPrompt({
+            title: 'Ask for review on the PR',
+            message: 'GitHub usernames, comma-separated. They are requested as reviewers on the PR; nothing waits on them.' +
+                (sugg.length ? ' Suggested from the STP\'s stakeholders: ' + sugg.map(function(p) { return '@' + p.github + (p.role ? ' (' + p.role + ')' : ''); }).join(', ') + '.' : ''),
+            placeholder: 'e.g. alice, bob',
+            defaultValue: sugg.map(function(p) { return p.github; }).join(', '),
+            confirmLabel: 'Request review',
+            onSubmit: async function(text) {
+                var logins = (text || '').split(/[,\s]+/).filter(Boolean);
+                if (!logins.length) return;
+                try {
+                    await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/request-review', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reviewers: logins, github_token: _lsGet('qf_github_token') || '' })
+                    });
+                    showToast('Review requested from ' + logins.map(function(l) { return '@' + l.replace(/^@/, ''); }).join(', '), 'success');
+                    _loadPrReviewers(jiraId);
+                } catch (e) { showToast('Could not request review: ' + e.message, 'error'); }
+            }
+        });
+    }
+
+    async function pullPrComments(jiraId) {
+        try {
+            var r = await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/pull-pr-comments', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ github_token: _lsGet('qf_github_token') || '' })
+            });
+            showToast(r.pulled
+                ? r.pulled + ' new PR comment' + (r.pulled !== 1 ? 's' : '') + ' queued — Request changes applies them to the STP'
+                : 'No new PR comments since the last pull', r.pulled ? 'success' : 'info');
+        } catch (e) { showToast('Could not pull PR comments: ' + e.message, 'error'); }
+    }
+
+    function addReviewNote(jiraId, phase) {
+        _showStyledPrompt({
+            title: 'Add a note to the ' + PHASE_META[phase].label,
+            message: 'Notes from everyone queue up; the next Request changes applies all of them to the document (it is edited, not regenerated).',
+            placeholder: 'e.g. TS-05 must cover start-after-cancel',
+            multiline: true,
+            maxLength: 4000,
+            confirmLabel: 'Add note',
+            onSubmit: async function(text) {
+                if (!(text || '').trim()) return;
+                try {
+                    var r = await api('/api/pipelines/' + encodeURIComponent(jiraId) + '/notes/' + phase, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: text, display_name: _lsGet('qf_display_name') || '' })
+                    });
+                    showToast((r.notes || []).length + ' note' + ((r.notes || []).length !== 1 ? 's' : '') + ' queued for the next Request changes', 'success');
+                } catch (e) { showToast('Could not add the note: ' + e.message, 'error'); }
+            }
+        });
+    }
+
     async function refreshPrStatus(jiraId) {
         var btn = document.getElementById('refreshPrBtn');
         if (btn) {
@@ -7462,6 +7687,7 @@ EOF</code></pre>
     // Project Settings
     // -----------------------------------------------------------------------
     var currentProjectData = null;
+    var _projectAutoPicked = false;
 
     function renderProjectFilter() {
         var sel = document.getElementById('projectFilter');
@@ -7476,7 +7702,19 @@ EOF</code></pre>
             if (!seen[p.project_id]) { seen[p.project_id] = true; projects.push(p.project_id); }
         });
         projects.sort();
+        // The shipped example project is a template to copy, not a team: hide
+        // it once a real project exists, unless it actually has runs.
+        if (projects.length > 1) {
+            projects = projects.filter(function(pid) {
+                return pid !== 'example' || pipelines.some(function(p) { return p.project_id === 'example'; });
+            });
+        }
         var current = sel.value;
+        // One real project: open on it, not on an "All Projects" view of one.
+        // Only on a plain landing: a deep link (#pipeline/X, #runs) keeps its view.
+        var landing = !window.location.hash || window.location.hash === '#command';
+        var autoPick = !_projectAutoPicked && landing && !_managerMode && projects.length === 1 && (current === 'all' || !current);
+        if (autoPick) { _projectAutoPicked = true; current = projects[0]; }
         var opts = [{ value: 'all', label: 'All Projects' }];
         // Manager mode: lead with Org + one option per cluster label
         if (_managerMode && _rollupData) {
@@ -7493,6 +7731,7 @@ EOF</code></pre>
         // Show/hide settings gear (real projects only)
         var btn = document.getElementById('projectSettingsBtn');
         btn.classList.toggle('hidden', sel.value === 'all' || sel.value.indexOf('__') === 0);
+        if (autoPick) sel.dispatchEvent(new Event('change'));
     }
 
     async function openProjectSettings() {
@@ -7583,7 +7822,7 @@ EOF</code></pre>
     // telemetry — never let it break navigation.
     function _beaconView(view) {
         try {
-            if (navigator.sendBeacon) navigator.sendBeacon('/api/beacon', JSON.stringify({ view: view }));
+            if (navigator.sendBeacon) navigator.sendBeacon('/api/beacon', JSON.stringify({ view: view, who: _lsGet('qf_display_name') || '' }));
         } catch (e) {}
     }
 
@@ -7683,15 +7922,16 @@ EOF</code></pre>
             metrics = res[0].value;
             if (res[1].status === 'fulfilled') trends = res[1].value;
         }
-        // Confidence and ROI are new endpoints the backend may not have shipped
-        // yet (or that 404 for a project with no pipeline_state files) — never
-        // let either one take the whole command view down.
+        // ROI, engineering, insights and review-cycle may 404 for a project
+        // with no pipeline_state files — never let one take the view down.
         var extra = await Promise.allSettled([
-            api('/api/metrics/confidence?project=' + encodeURIComponent(projectId)),
             api('/api/metrics/roi?project=' + encodeURIComponent(projectId) + _memberQuery()),
             api('/api/metrics/engineering?project=' + encodeURIComponent(projectId) + _memberQuery()),
             api('/api/insights?project=' + encodeURIComponent(projectId)),
-            api('/api/metrics/review-cycle?project=' + encodeURIComponent(projectId))
+            api('/api/metrics/review-cycle?project=' + encodeURIComponent(projectId)),
+            api('/api/metrics/drift?project=' + encodeURIComponent(projectId)),
+            api('/api/metrics/usage'),
+            api('/api/members?project=' + encodeURIComponent(projectId))
         ]);
         setHtml(el, renderCommandCenterHtml({
             projectLabel: _projectLabel(projectId),
@@ -7699,11 +7939,13 @@ EOF</code></pre>
             trends: trends || { history: [] },
             activity: activityEvents || [],
             pipelines: pipelines || [],
-            confidence: extra[0].status === 'fulfilled' ? extra[0].value : null,
-            roi: extra[1].status === 'fulfilled' ? extra[1].value : null,
-            engineering: extra[2].status === 'fulfilled' ? extra[2].value : null,
-            insights: extra[3].status === 'fulfilled' ? ((extra[3].value && extra[3].value.insights) || []) : [],
-            reviewCycle: extra[4].status === 'fulfilled' ? extra[4].value : null
+            roi: extra[0].status === 'fulfilled' ? extra[0].value : null,
+            engineering: extra[1].status === 'fulfilled' ? extra[1].value : null,
+            insights: extra[2].status === 'fulfilled' ? ((extra[2].value && extra[2].value.insights) || []) : [],
+            reviewCycle: extra[3].status === 'fulfilled' ? extra[3].value : null,
+            drift: extra[4].status === 'fulfilled' ? extra[4].value : null,
+            usage: extra[5].status === 'fulfilled' ? extra[5].value : null,
+            members: extra[6].status === 'fulfilled' ? ((extra[6].value && extra[6].value.members) || []) : []
         }));
     }
 
@@ -7887,28 +8129,18 @@ EOF</code></pre>
                 '</div></label>';
         }).join('');
 
-        // Repositories
-        var primary = data.repositories.primary || {};
-        var tier2 = data.repositories.tier2 || {};
-        var additional = data.repositories.additional || [];
-        var reposHtml = '';
-        if (primary.full_name) {
-            reposHtml += '<div class="flex items-center justify-between py-2 px-4 rounded-lg bg-qf-card/30">' +
-                '<div><div class="text-sm font-medium text-qf-text">' + escapeHtml(primary.full_name) + '</div>' +
-                '<div class="text-xs text-qf-muted">' + escapeHtml(primary.language || '') + ' \u00B7 ' + escapeHtml(primary.build_system || '') + ' \u00B7 Primary</div></div>' +
-                '<span class="text-xs text-qf-accent">Tier 1</span></div>';
-        }
-        if (tier2.full_name) {
-            reposHtml += '<div class="flex items-center justify-between py-2 px-4 rounded-lg bg-qf-card/30 mt-2">' +
-                '<div><div class="text-sm font-medium text-qf-text">' + escapeHtml(tier2.full_name) + '</div>' +
-                '<div class="text-xs text-qf-muted">' + escapeHtml(tier2.language || '') + ' \u00B7 Tier 2 test repo</div></div>' +
-                '<span class="text-xs text-qf-purple">Tier 2</span></div>';
-        }
-        additional.forEach(function(r) {
-            reposHtml += '<div class="py-2 px-4 rounded-lg bg-qf-card/30 mt-2">' +
-                '<div class="text-sm text-qf-text">' + escapeHtml(r.full_name || r.name || '') + '</div>' +
-                '<div class="text-xs text-qf-muted">Additional</div></div>';
-        });
+        // Repositories, grouped by role. The second tests repo shows only when set.
+        var repos = data.repos || [];
+        var reposHtml = [
+            ['primary', 'Tests repo'], ['tier2', 'Second tests repo'],
+            ['design_docs', 'Design docs'], ['additional', 'Context repos'],
+        ].map(function(g) {
+            var rows = repos.filter(function(r) { return r.role === g[0]; });
+            if (g[0] === 'tier2' && !rows.length) return '';
+            return '<div class="mb-4"><div class="text-[10px] text-qf-muted uppercase tracking-wider mb-1">' + g[1] + '</div>' +
+                (rows.length ? rows.map(_repoRowHtml).join('') : '<div class="text-xs text-qf-muted px-4 py-2">Not set</div>') +
+                '</div>';
+        }).join('');
 
         // Components
         var compsHtml = (data.components || []).map(function(c) {
@@ -7985,7 +8217,15 @@ EOF</code></pre>
             '<button onclick="bulkOnboardProject(\'' + escapeHtml(data.id) + '\')" id="bulkOnboardBtn" ' +
             'class="px-3 py-1.5 bg-qf-accent/20 text-qf-accent text-xs font-medium rounded-lg hover:bg-qf-accent/30 transition-colors">' +
             'Onboard All Repos</button></div></div>' +
-            '<div class="p-5">' + (reposHtml || '<div class="text-sm text-qf-muted">No repositories configured</div>') +
+            '<div class="p-5">' + reposHtml +
+            '<form onsubmit="addProjectRepo(event)" class="flex flex-wrap items-center gap-2 pt-3 border-t border-qf-border">' +
+            '<input type="text" id="addRepoInput" required placeholder="org/repo or https://github.com/org/repo" aria-label="Repository" ' +
+            'class="flex-1 bg-qf-card border border-qf-border text-qf-text text-sm rounded-md px-3 py-1.5 focus:outline-none focus:border-qf-accent placeholder:text-qf-muted/60">' +
+            '<select id="addRepoRole" aria-label="Role" class="bg-qf-card border border-qf-border text-qf-text text-sm rounded-md px-3 py-1.5 focus:outline-none focus:border-qf-accent">' +
+            '<option value="primary">Tests repo</option><option value="design_docs">Design docs</option>' +
+            '<option value="additional" selected>Context repo</option><option value="tier2">Second tests repo</option></select>' +
+            '<button type="submit" class="px-3 py-1.5 bg-qf-accent/20 text-qf-accent text-xs font-medium rounded-lg hover:bg-qf-accent/30 transition-colors">Save</button>' +
+            '</form>' +
             '<div id="bulkOnboardProgress" class="hidden mt-4"></div>' +
             '</div></div>' +
 
@@ -8001,6 +8241,53 @@ EOF</code></pre>
 
             '</div>'
         );
+    }
+
+    function _repoRowHtml(r) {
+        var status = r.checked_out
+            ? '<span class="text-qf-green">checked out</span> <span class="mono">' + escapeHtml(r.checkout_path) + '</span>'
+            : 'no checkout — LSP and existing-test search skip it';
+        // Data attributes, not inline JS strings: full_name comes from a YAML file.
+        var remove = r.role === 'primary' ? '' :
+            '<button onclick="removeProjectRepo(this)" data-repo="' + escapeHtml(r.full_name) + '" data-role="' + escapeHtml(r.role) + '" ' +
+            'class="text-xs text-qf-muted hover:text-qf-red transition-colors ml-4">Remove</button>';
+        return '<div class="flex items-center justify-between py-2 px-4 rounded-lg bg-qf-card/30 mt-2">' +
+            '<div><a href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener noreferrer" class="text-sm font-medium text-qf-text hover:text-qf-accent">' + escapeHtml(r.full_name) + '</a>' +
+            '<div class="text-xs text-qf-muted">' + (r.language ? escapeHtml(r.language) + ' · ' : '') + status + '</div></div>' +
+            remove + '</div>';
+    }
+
+    async function _saveProjectRepo(method, repo, role) {
+        var projectId = currentProjectData.id;
+        try {
+            await api('/api/projects/' + encodeURIComponent(projectId) + '/repos', {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repo: repo, role: role }),
+            });
+            currentProjectData = await api('/api/projects/' + encodeURIComponent(projectId));
+            renderProjectSettings(currentProjectData);
+            return true;
+        } catch (e) {
+            showToast('Couldn\'t update repositories — ' + _errText(e), 'error');
+            return false;
+        }
+    }
+
+    async function addProjectRepo(event) {
+        event.preventDefault();
+        var repo = document.getElementById('addRepoInput').value.trim();
+        var role = document.getElementById('addRepoRole').value;
+        var held = role !== 'additional' && (currentProjectData.repos || []).find(function(r) { return r.role === role; });
+        var name = repo.replace(/^(https?:\/\/)?(www\.)?github\.com\//, '').replace(/\/$/, '').replace(/\.git$/, '');
+        if (held && held.full_name !== name && !confirm('Replace ' + held.full_name + ' with ' + name + '?')) return;
+        if (await _saveProjectRepo('POST', repo, role)) showToast(name + ' saved', 'success');
+    }
+
+    async function removeProjectRepo(btn) {
+        var repo = btn.dataset.repo, role = btn.dataset.role;
+        if (!confirm('Remove ' + repo + ' from this project?')) return;
+        if (await _saveProjectRepo('DELETE', repo, role)) showToast(repo + ' removed', 'success');
     }
 
     async function toggleFeature(projectId, key, enabled, el) {
@@ -8158,7 +8445,7 @@ EOF</code></pre>
     async function scanGitHubOrg() {
         var org = document.getElementById('orgNameInput').value.trim();
         if (!org) { showToast('Enter an org name', 'error'); return; }
-        // Extract org name from GitHub URLs (e.g. https://github.com/kubevirt or https://github.com/orgs/kubevirt/repositories)
+        // Extract org name from GitHub URLs (e.g. https://github.com/my-org or https://github.com/orgs/my-org/repositories)
         var urlMatch = org.match(/github\.com\/(?:orgs\/)?([a-zA-Z0-9_.-]+)/);
         if (urlMatch) org = urlMatch[1];
         var btn = document.getElementById('orgScanBtn');
@@ -8476,7 +8763,7 @@ EOF</code></pre>
         '<div class="bg-qf-surface border border-qf-border rounded-xl p-6 space-y-6">' +
             '<div>' +
             '<h3 class="text-sm font-semibold text-qf-text mb-4">Primary Repository (Tier 1)</h3>' +
-            wizInput('Repository', 'primary_repo', { placeholder: 'e.g. kubevirt/kubevirt (org/repo)' }) +
+            wizInput('Repository', 'primary_repo', { placeholder: 'e.g. my-org/my-repo (org/repo)' }) +
             '<div class="grid qf-cols-2 gap-4">' +
             '<div><label class="block text-sm font-medium text-qf-text mb-1.5">Language</label>' +
             '<select onchange="wizardData.primary_language = this.value" class="w-full bg-qf-card border border-qf-border text-qf-text text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-qf-accent">' +
@@ -8504,7 +8791,7 @@ EOF</code></pre>
             '<div class="text-xs text-qf-muted mb-2">Component names from Jira (mapped to code packages later)</div>' +
             wizardData.components.map(function(c, i) {
                 return '<div class="flex items-center gap-2 mb-2">' +
-                    '<input type="text" value="' + escapeHtml(c) + '" placeholder="e.g. virt-controller" ' +
+                    '<input type="text" value="' + escapeHtml(c) + '" placeholder="e.g. api-server" ' +
                     'oninput="wizardData.components[' + i + '] = this.value" ' +
                     'class="flex-1 bg-qf-card border border-qf-border text-qf-text text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-qf-accent">' +
                     (wizardData.components.length > 1 ?
@@ -9900,17 +10187,19 @@ function renderCommandCenterHtml(d) {
     var trendHistory = (d.trends && d.trends.history) || [];
     var pipelines = d.pipelines || [];
     var activity = d.activity || [];
-    var confidence = d.confidence || null;
     var roi = d.roi || null;
     var engineering = d.engineering || null;
     var insights = d.insights || [];
     var reviewCycle = d.reviewCycle || null;
 
+    // What waits on a person comes first: the pilot's reviewers opened a
+    // page of metrics and had to scroll to find the plan waiting for them.
     var html = '<div style="display:flex;flex-direction:column;gap:16px">';
-    html += _ccValueStrip(totals, value, trendHistory, confidence, engineering);
-    html += _ccRoiPanel(roi, value, trendHistory, reviewCycle);
+    html += _ccNeedsYouCard(pipelines, reviewCycle);
+    html += _ccValueStrip(totals, value, trendHistory, engineering, d.drift);
+    html += _ccRoiPanel(roi, value, trendHistory, reviewCycle, d.usage, d.members);
     html += _ccInsightsCard(insights);
-    html += _ccRow2(pipelines, value, reviewCycle);
+    html += _ccRow2(value);
     html += _ccRow3(value, activity);
     html += '</div>';
     return html;
@@ -9968,7 +10257,7 @@ function _bandChip(text, cls) {
 // Row 1 — value strip
 // -----------------------------------------------------------------------
 
-function _ccValueStrip(totals, value, trendHistory, confidence, engineering) {
+function _ccValueStrip(totals, value, trendHistory, engineering, drift) {
     var tg = value.tests_generated || {};
     var cov = value.coverage || {};
     var eng = engineering || {};
@@ -9976,12 +10265,10 @@ function _ccValueStrip(totals, value, trendHistory, confidence, engineering) {
     // nobody anything actionable, and per-person spend now lives in each
     // user's own GCP project. Per-ticket/phase cost stays in the run detail,
     // which is the level where it actually informs a decision.
-    return '<div class="grid qf-cols-5 gap-4">' +
-        _ccConfidenceCard(confidence) +
+    return '<div class="grid qf-cols-3 gap-4">' +
         _ccCoverageCard(cov, trendHistory) +
-        _ccDeliveryCard(totals, tg) +
+        _ccDeliveryCard(totals, tg, drift) +
         _ccCycleCard(eng.cycle) +
-        _ccAutomationCard(eng.automation, eng.first_pass) +
         '</div>';
 }
 
@@ -10015,10 +10302,14 @@ function _ccAreaChart(pts, rgb, opts) {
     for (i = 0; i < pts.length; i++) vals.push(pts[i].v);
     var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
     var range = (mx - mn) || 1;
+    // x by date when every point has one: snapshots are written on page
+    // views, so days are missing, and even spacing drew a gap of a week as a day.
+    var ts = pts.map(function(p) { return p.date ? new Date(p.date).getTime() : NaN; });
+    var byDate = ts.every(function(t) { return !isNaN(t); }) && ts[ts.length - 1] > ts[0];
     var stepX = (w - padX * 2) / (pts.length - 1);
     var line = '', ptStr = '', xy = [];
     for (i = 0; i < pts.length; i++) {
-        var x = padX + i * stepX;
+        var x = byDate ? padX + (ts[i] - ts[0]) / (ts[ts.length - 1] - ts[0]) * (w - padX * 2) : padX + i * stepX;
         var y = top + (1 - (vals[i] - mn) / range) * (h - top - bottom);
         xy.push({ x: x, y: y });
         line += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
@@ -10071,92 +10362,6 @@ function _ccTrendSlot(pts, rgb, opts) {
     var h = opts.height || 56;
     var msg = (pts && pts.length === 1) ? 'Day 1 of daily history — trend line appears tomorrow' : 'No daily history recorded yet';
     return '<div class="text-[10px] text-qf-muted/70" style="height:' + h + 'px;display:flex;align-items:center">' + msg + '</div>' + cap;
-}
-
-// band -> { chip class (precompiled combo only), left-border rgb, label }
-var CONFIDENCE_BAND_META = {
-    trusted:      { cls: 'bg-qf-green/10 border-qf-green/30 text-qf-green',   rgb: '63,185,80',    label: 'trusted' },
-    watch:        { cls: 'bg-qf-yellow/10 border-qf-yellow text-qf-yellow',   rgb: '210,153,34',   label: 'watch' },
-    at_risk:      { cls: 'bg-qf-red/10 border-qf-red/30 text-qf-red',         rgb: '248,81,73',    label: 'at risk' },
-    insufficient: { cls: 'bg-gray-900/30 border-qf-muted text-qf-muted',      rgb: '139,148,158',  label: 'insufficient' }
-};
-
-function _humanizeSignal(key) {
-    if (!key) return '';
-    return key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ');
-}
-
-// What to actually do about a low signal — shown as the tooltip on
-// "Biggest drag", so the score points at a fix instead of just a name.
-var SIGNAL_REMEDIES = {
-    coverage: 'Some requirements have no matching generated test — add scenarios for the uncovered requirements or regenerate tests',
-    link_quality: 'STD scenarios are missing explicit requirement/scenario ids (matched by position instead) — regenerate the STD to restore authored traceability',
-    review_health: 'Review findings are dragging the weighted score — address critical/major findings and re-review',
-    refinement: 'A refine phase had to run: the first review demanded revision',
-    verification: 'Generated tests failed compile/collection verification — inspect the codegen phase output',
-    effectiveness: 'Recorded CI runs have failing tests — see the CI Test Runs card on the ticket page',
-    freshness: 'Artifacts are stale relative to the source — re-run the pipeline'
-};
-
-// The rollup score/band is a project-wide average with no signal breakdown of
-// its own (per the /api/metrics/confidence contract); "Confidence N/7" and
-// "Biggest drag" describe one representative ticket instead. The worst
-// non-insufficient ticket is the most actionable choice — it's the one
-// dragging the average down.
-function _ccWorstConfidenceTicket(tickets) {
-    var worst = null;
-    for (var i = 0; i < tickets.length; i++) {
-        var t = tickets[i] || {};
-        if (t.band === 'insufficient') continue;
-        if (!worst || (_ccHasNum(t.score) && t.score < worst.score)) worst = t;
-    }
-    return worst || tickets[0] || null;
-}
-
-function _ccConfidenceCard(confidence) {
-    var rollup = confidence && confidence.rollup;
-    var hasScore = rollup && _ccHasNum(rollup.score) && rollup.band !== 'insufficient';
-
-    if (!hasScore) {
-        var m = CONFIDENCE_BAND_META.insufficient;
-        var subMsg = rollup ? 'not enough signals' : 'No data yet';
-        return '<div class="bg-qf-card border border-qf-border rounded-lg p-5 flex flex-col gap-2" ' +
-            'style="border-left:4px solid rgb(' + m.rgb + ');min-width:0">' +
-            '<div class="flex items-center gap-2 flex-wrap">' + _ccEyebrow('Confidence') + '<span class="flex-1"></span>' +
-            _bandChip(m.label, m.cls) + '</div>' +
-            '<div class="text-3xl font-bold text-qf-text tabular-nums leading-tight">&mdash;</div>' +
-            '<div class="text-[11px] text-qf-muted">' + subMsg + '</div>' +
-            '</div>';
-    }
-
-    var meta = CONFIDENCE_BAND_META[rollup.band] || CONFIDENCE_BAND_META.insufficient;
-    var worst = _ccWorstConfidenceTicket(confidence.tickets || []);
-    var nOfTotal = (worst && _ccHasNum(worst.signals_present) && _ccHasNum(worst.signals_total))
-        ? (worst.signals_present + '/' + worst.signals_total) : null;
-    var drag = (worst && worst.biggest_drag) ? _humanizeSignal(worst.biggest_drag) : null;
-    // Drill down to the ticket dragging the rollup score down the most — the
-    // one actionable identity this card can point at (see
-    // _ccWorstConfidenceTicket for why it's this ticket, not the rollup).
-    var clickable = !!(worst && worst.jira_id);
-    var cardCls = 'bg-qf-card border border-qf-border rounded-lg p-5 flex flex-col gap-2' +
-        (clickable ? ' cursor-pointer transition-shadow hover:ring-1 hover:ring-qf-accent/40' : '');
-    var interactiveAttrs = clickable
-        ? ' role="button" tabindex="0" onclick="showPipelineDetail(\'' + escapeHtml(worst.jira_id) + '\')" ' +
-          'onkeydown="if(event.key===\'Enter\'){showPipelineDetail(\'' + escapeHtml(worst.jira_id) + '\')}" ' +
-          'title="Open ' + escapeHtml(worst.jira_id) + '"'
-        : '';
-
-    return '<div class="' + cardCls + '" style="border-left:4px solid rgb(' + meta.rgb + ');min-width:0"' + interactiveAttrs + '>' +
-        '<div class="flex items-center gap-2 flex-wrap">' + _ccEyebrow('Confidence') + '<span class="flex-1"></span>' +
-        (rollup.basis ? _ccChip(escapeHtml(rollup.basis), 'purple') : '') +
-        _bandChip(meta.label, meta.cls) + '</div>' +
-        '<div class="text-3xl font-bold text-qf-text tabular-nums leading-tight">' + rollup.score + '</div>' +
-        '<div class="text-[11px] text-qf-muted">' + (nOfTotal ? 'Confidence ' + nOfTotal : ' ') + '</div>' +
-        '<div class="text-[11px] text-qf-muted"' +
-        (drag && worst && SIGNAL_REMEDIES[worst.biggest_drag]
-            ? ' title="' + escapeHtml(SIGNAL_REMEDIES[worst.biggest_drag]) + '" style="cursor:help;text-decoration:underline dotted rgba(139,148,158,0.5)"' : '') +
-        '>' + (drag ? 'Biggest drag: ' + escapeHtml(drag) : ' ') + '</div>' +
-        '</div>';
 }
 
 function _ccTimeSavedCard(value, trendHistory) {
@@ -10218,7 +10423,7 @@ function _ccCoverageCard(cov, trendHistory) {
 // Merges the old standalone Pipelines-completion and Tests-on-record cards
 // into one "Delivery" card — frees a slot in the 6-card KPI strip for the
 // new engineering-health cards below without losing either number.
-function _ccDeliveryCard(totals, tg) {
+function _ccDeliveryCard(totals, tg, drift) {
     var completed = totals.completed || 0;
     var total = totals.pipelines || 0;
     var pct = _ccHasNum(totals.completion_pct) ? totals.completion_pct : (total > 0 ? Math.round(completed / total * 100) : 0);
@@ -10230,8 +10435,16 @@ function _ccDeliveryCard(totals, tg) {
         'stroke-dasharray="' + dash.toFixed(1) + ' 113" stroke-linecap="round" transform="rotate(-90 20 20)"></circle>' +
         '</svg>';
     var testsTotal = _ccHasNum(tg.total_tests) ? tg.total_tests : (tg.total_files || 0);
-    var testsSub = testsTotal + ' test' + (testsTotal !== 1 ? 's' : '') + ' on record' +
+    var testsSub = testsTotal + ' test' + (testsTotal !== 1 ? 's' : '') + ' generated' +
         (tg.scaffolded_files ? ' (' + tg.scaffolded_files + ' scaffolded)' : '');
+    // Generated is not delivered: how many generated files the tests repo
+    // checkout actually has (drift compares the checksums codegen recorded).
+    var landed = 0, tracked = 0;
+    ((drift && drift.tickets) || []).forEach(function(t) {
+        if (!t.available) return;
+        (t.files || []).forEach(function(f) { tracked++; if (f.status !== 'missing') landed++; });
+    });
+    if (tracked) testsSub += ' &middot; ' + landed + ' of ' + tracked + ' files in the tests repo';
     return '<div class="bg-qf-card border border-qf-border rounded-lg p-5 flex flex-col gap-2 cursor-pointer transition-shadow hover:ring-1 hover:ring-qf-accent/40" ' +
         'role="button" tabindex="0" onclick="navigateTo(\'runs\')" onkeydown="if(event.key===\'Enter\'){navigateTo(\'runs\')}" title="Open Runs" ' +
         'style="border-left:4px solid ' + ringColor + ';min-width:0">' +
@@ -10271,57 +10484,6 @@ function _ccCycleCard(cycle) {
         (cycle.basis ? _ccChip(escapeHtml(cycle.basis), 'purple') : '') + '</div>' +
         '<div class="text-3xl font-bold text-qf-text tabular-nums leading-tight">' + _ccHumanizeSeconds(cycle.median) + '</div>' +
         '<div class="text-[11px] text-qf-muted">P90 ' + _ccHumanizeSeconds(cycle.p90) + ' &middot; ' + cycle.n + ' run' + (cycle.n !== 1 ? 's' : '') + '</div>' +
-        '</div>';
-}
-
-function _ccAutomationCard(automation, firstPass) {
-    automation = automation || {};
-    firstPass = firstPass || {};
-    var hasAuto = !automation.unavailable_reason && _ccHasNum(automation.automation_rate);
-    var autoBig = hasAuto ? Math.round(automation.automation_rate * 100) + '%' : '—';
-    var autoSub = hasAuto
-        ? (_ccHasNum(automation.human_touches_per_run) ? automation.human_touches_per_run.toFixed(1) + ' human touches/run' : ' ')
-        : escapeHtml(automation.unavailable_reason || 'Not enough completed runs yet');
-
-    var fullRun = firstPass.full_run || {};
-    var hasFp = !fullRun.unavailable_reason && _ccHasNum(fullRun.rate);
-    var fpBig = hasFp ? Math.round(fullRun.rate * 100) + '%' : '—';
-    var famPart = function(label, fam) {
-        fam = fam || {};
-        return label + ' ' + (!fam.unavailable_reason && _ccHasNum(fam.rate) ? Math.round(fam.rate * 100) + '%' : '—');
-    };
-    var fpSub = hasFp
-        ? [famPart('STP', firstPass.stp), famPart('STD', firstPass.std), famPart('Code', firstPass.code)].join(' &middot; ')
-        : escapeHtml(fullRun.unavailable_reason || 'Not enough completed runs yet');
-
-    // Rework line: only families that actually have a measured rate get
-    // listed — an unavailable_reason family is omitted rather than shown as 0%.
-    var rework = firstPass.rework || {};
-    var reworkParts = [];
-    [['STP', rework.stp], ['STD', rework.std], ['Code', rework.code]].forEach(function(pair) {
-        var fam = pair[1] || {};
-        if (!fam.unavailable_reason && _ccHasNum(fam.rate)) {
-            reworkParts.push(pair[0] + ' ' + Math.round(fam.rate * 100) + '%');
-        }
-    });
-    var reworkLine = reworkParts.length
-        ? '<div class="text-[10px] text-qf-muted" style="margin-top:2px">rework: ' + reworkParts.join(', ') + '</div>' : '';
-
-    return '<div class="bg-qf-card border border-qf-border rounded-lg p-5 flex flex-col gap-2 cursor-pointer transition-shadow hover:ring-1 hover:ring-qf-accent/40" ' +
-        'role="button" tabindex="0" onclick="navigateTo(\'runs\')" onkeydown="if(event.key===\'Enter\'){navigateTo(\'runs\')}" title="Open Runs" ' +
-        'style="border-left:4px solid rgb(236,72,153);min-width:0">' +
-        '<div class="flex items-center gap-2 flex-wrap">' + _ccEyebrow('Automation') + '<span class="flex-1"></span>' +
-        (hasAuto && automation.basis ? _ccChip(escapeHtml(automation.basis), 'purple') : '') + '</div>' +
-        '<div class="text-3xl font-bold text-qf-text tabular-nums leading-tight">' + autoBig + '</div>' +
-        '<div class="text-[11px] text-qf-muted">' + autoSub + '</div>' +
-        '<div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:5px">' +
-        '<div class="flex items-center justify-between">' +
-        '<span class="text-[10px] font-semibold uppercase tracking-wide text-qf-muted">First-Pass</span>' +
-        '<span class="text-sm font-bold text-qf-text tabular-nums">' + fpBig + '</span>' +
-        '</div>' +
-        '<div class="text-[10px] text-qf-muted" style="margin-top:2px">' + fpSub + '</div>' +
-        reworkLine +
-        '</div>' +
         '</div>';
 }
 
@@ -10368,13 +10530,38 @@ function _ccReviewCycleCard(rc) {
         rows + '</div>');
 }
 
-function _ccRoiPanel(roi, value, trendHistory, reviewCycle) {
+function _ccRoiPanel(roi, value, trendHistory, reviewCycle, usage, members) {
     // Cost cards hidden for now: cost_usd is read straight from the Claude
     // CLI's total_cost_usd, which goes stale/unreliable once billing runs
     // through Vertex instead of a direct Anthropic key. Backend still
     // computes it (ui.py _compute_roi_metrics); just not rendered here.
-    return '<div class="grid qf-cols-5 gap-4">' + _ccTimeSavedCard(value, trendHistory) +
-        _ccReviewCycleCard(reviewCycle) + '</div>';
+    return '<div class="grid qf-cols-4 gap-4">' + _ccTimeSavedCard(value, trendHistory) +
+        _ccReviewCycleCard(reviewCycle) + _ccAdoptionCard(usage, members) + '</div>';
+}
+
+// Adoption: who opened the dashboard (beacon: SSO user or the display name
+// set in Settings) and who ran a pipeline (attributed phases). The pilot's
+// first question is whether anyone used it; this answers it on the page.
+function _ccAdoptionCard(usage, members) {
+    var viewers = (usage && usage.viewers) || {};
+    var cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    var recent = Object.keys(viewers).filter(function(w) { return (viewers[w].last_seen || '') >= cutoff; })
+        .sort(function(a, b) { return viewers[b].active_days - viewers[a].active_days; });
+    var runners = (members || []).filter(function(m) { return m.runs > 0; });
+    var anon = (usage && usage.anonymous_hits) || 0;
+    var rows = recent.slice(0, 4).map(function(w) {
+        var v = viewers[w];
+        return '<div class="flex items-center justify-between text-[11px]"><span class="text-qf-text truncate">' + escapeHtml(w) +
+            '</span><span class="text-qf-muted tabular-nums">' + v.active_days + 'd &middot; ' + escapeHtml(_ccShortDate(v.last_seen)) + '</span></div>';
+    }).join('');
+    return '<div class="bg-qf-card border border-qf-border rounded-lg p-5 flex flex-col gap-2" style="border-left:4px solid rgb(56,189,248);min-width:0">' +
+        _ccEyebrow('Adoption') +
+        '<div class="text-3xl font-bold text-qf-text tabular-nums leading-tight">' + recent.length + '</div>' +
+        '<div class="text-[11px] text-qf-muted">named viewer' + (recent.length !== 1 ? 's' : '') + ' in 30 days &middot; ' +
+        runners.length + ' ran a pipeline</div>' +
+        (rows ? '<div class="flex flex-col gap-1" style="border-top:1px solid rgba(255,255,255,0.06);padding-top:5px">' + rows + '</div>' : '') +
+        (anon ? '<div class="text-[10px] text-qf-muted">' + anon + ' views with no name set in Settings</div>' : '') +
+        '</div>';
 }
 
 // -----------------------------------------------------------------------
@@ -10423,15 +10610,10 @@ function _ccInsightsCard(insights) {
 // Row 2 — Needs You (left) / Coverage trend + Review approvals (right)
 // -----------------------------------------------------------------------
 
-function _ccRow2(pipelines, value, reviewCycle) {
+function _ccRow2(value) {
     var cov = value.coverage || {};
     var rq = value.review_quality || {};
-    var needsYou = '<div style="flex:7 1 0%;min-width:0">' + _ccNeedsYouCard(pipelines, reviewCycle) + '</div>';
-    var right = '<div style="flex:5 1 0%;min-width:0;display:flex;flex-direction:column;gap:16px">' +
-        _ccCoverageTrendCard(cov) +
-        _ccReviewApprovalsCard(rq) +
-        '</div>';
-    return '<div style="display:flex;gap:16px;align-items:stretch">' + needsYou + right + '</div>';
+    return '<div class="grid qf-cols-2 gap-4">' + _ccCoverageTrendCard(cov) + _ccReviewApprovalsCard(rq) + '</div>';
 }
 
 // Derives "needs attention" rows straight from pipeline phase status — no
@@ -10513,7 +10695,7 @@ function _ccNeedsYouCard(pipelines, reviewCycle) {
     // link out to GitHub rather than opening a pipeline detail, so they render as
     // anchors below the pipeline rows instead of joining that sort.
     var sideLabel = { waiting_reviewer: 'reviewer', waiting_author: 'author',
-                      waiting_ack: 'acknowledgement', stale: 'nobody — gone quiet' };
+                      waiting_ack: 'acknowledgement', stale: 'author — gone quiet' };
     if (reviewCycle && reviewCycle.available) {
         var prs = (reviewCycle.prs || []).filter(function(p) { return p.over_sla; });
         prs.sort(function(a, b) { return (a.since || '').localeCompare(b.since || ''); });
@@ -10526,7 +10708,7 @@ function _ccNeedsYouCard(pipelines, reviewCycle) {
             prRows.push({
                 url: pr.url || '',
                 // Short repo name: the full org/repo wrapped to three lines in the
-                // 92px label column ("RedHatQE/openshift-virtualization-tests#5958").
+                // 92px label column ("my-org/a-long-repository-name#5958").
                 label: String(pr.repo || '').split('/').pop() + '#' + (pr.number || ''),
                 reason: 'Waiting on ' + (sideLabel[pr.state] || pr.state || '?') + ' ' +
                     (_ccHasNum(pr.age_hours) ? Math.round(pr.age_hours) + 'h' : '') + ' — ' + (pr.title || ''),
@@ -10777,6 +10959,12 @@ function renderRunTimelineHtml(pipeline) {
         var status = isCovered ? 'completed' : (ph.status || 'pending');
         var si = STATUS_ICONS[status] || STATUS_ICONS.pending;
         var label = ph.label || meta.label || meta.key;
+        // The builder runs review and refine itself and records both when it
+        // finishes, one timestamp for start and end: no real span to show.
+        var parentKey = meta.key.replace(/_(review|refine)$/, '');
+        var parent = parentKey !== meta.key ? phases[parentKey] : null;
+        var inside = (parent && ph.started_ts && ph.started_ts === ph.finished_ts)
+            ? ((CANONICAL_PHASES.filter(function(m) { return m.key === parentKey; })[0] || {}).label || parentKey) : '';
 
         var subLines = '';
         if (isCovered) {
@@ -10805,15 +10993,17 @@ function renderRunTimelineHtml(pipeline) {
                     (ph.model ? 'model ' + escapeHtml(ph.model) : '') +
                     (refModel && refModel !== ph.model ? (ph.model ? ' · ' : '') + 'refined with ' + escapeHtml(refModel) : '') + '</div>';
             }
-            if (_runByText(ph)) {
+            if (inside) {
+                subLines += '<div class="text-[10px] text-qf-muted">ran inside ' + escapeHtml(inside) + '</div>';
+            } else if (_runByText(ph)) {
                 subLines += '<div class="text-[10px] text-qf-muted">run by ' + escapeHtml(_runByText(ph)) + '</div>';
             }
         }
 
-        var durText = isCovered ? '—' : fmtDuration(ph.duration_seconds);
+        var durText = isCovered || inside ? '—' : fmtDuration(ph.duration_seconds);
         var durColor = status === 'failed' ? 'text-qf-red' : status === 'awaiting_approval' ? 'text-qf-orange' : 'text-qf-text';
-        var startedTxt = isCovered ? '' : fmtClock(ph.started_ts);
-        var finishedTxt = isCovered ? '' : fmtClock(ph.finished_ts);
+        var startedTxt = isCovered || inside ? '' : fmtClock(ph.started_ts);
+        var finishedTxt = isCovered || inside ? '' : fmtClock(ph.finished_ts);
 
         return '<div class="flex gap-3 items-start py-2' + (i < order.length - 1 ? ' border-b border-qf-border/40' : '') + '">' +
             '<span class="w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold ' + si.cssClass + '">' + si.icon + '</span>' +
@@ -11254,7 +11444,9 @@ function renderTraceabilityHtml(d) {
     function scenarioChainCard(sc) {
         sc = sc || {};
         var linkGood = sc.link === 'id';
-        var linkChip = linkGood
+        var linkChip = sc.link === 'stp'
+            ? '<span class="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-qf-muted/10 border border-qf-border text-qf-muted">planned in STP · no STD yet</span>'
+            : linkGood
             ? '<span class="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-qf-green/10 border border-qf-green/50 text-qf-green">link: id</span>'
             : '<span class="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-qf-yellow/10 border border-dashed border-qf-yellow text-qf-yellow">link: inferred</span>';
         var priorityChip = sc.priority
@@ -11325,13 +11517,15 @@ function renderTraceabilityHtml(d) {
             testCount += (sc.tests || []).length;
             var st = sc.coverage_status || 'NEW';
             covCounts[st] = (covCounts[st] || 0) + 1;
-            if (sc.link === 'id') idCount++; else inferredCount++;
+            if (sc.link === 'id') idCount++; else if (sc.link === 'inferred') inferredCount++;
         });
         var covChips = Object.keys(covCounts).map(function(k) {
             return '<span class="' + covChipClass(k) + ' text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded-full whitespace-nowrap">' + escapeHtml(k) + ' ' + covCounts[k] + '</span>';
         }).join(' ');
         var linkQualityHtml = scenarios.length === 0
             ? '<span class="text-[10px] text-qf-muted">—</span>'
+            : idCount + inferredCount === 0
+            ? '<span class="text-[10px] text-qf-muted">STP only</span>'
             : idCount === 0
             ? '<span class="text-[10px] text-qf-yellow">all inferred</span>'
             : inferredCount === 0
@@ -11421,14 +11615,14 @@ function renderTraceabilityHtml(d) {
 
         var uniqueScenarios = collectUniqueScenarios(requirements, orphaned);
         var idCount = 0, inferredCount = 0;
-        uniqueScenarios.forEach(function(sc) { if (sc.link === 'id') idCount++; else inferredCount++; });
+        uniqueScenarios.forEach(function(sc) { if (sc.link === 'id') idCount++; else if (sc.link === 'inferred') inferredCount++; });
         var card3 = '<div class="bg-qf-card border border-qf-border rounded-lg p-3 flex flex-col gap-2">' +
             '<div class="text-[10px] font-semibold uppercase tracking-wider text-qf-muted">Link quality</div>' +
             '<div class="flex items-center gap-2">' +
             '<span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full bg-qf-green/10 border border-qf-green/50 text-qf-green">' + idCount + ' id</span>' +
             '<span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full bg-qf-yellow/10 border border-dashed border-qf-yellow text-qf-yellow">' + inferredCount + ' inferred</span>' +
             '</div>' +
-            '<div class="text-[11px] text-qf-muted">of ' + uniqueScenarios.length + ' scenario' + (uniqueScenarios.length === 1 ? '' : 's') + ' — how many are matched by position, not id</div>' +
+            '<div class="text-[11px] text-qf-muted">of ' + (idCount + inferredCount) + ' STD scenario' + ((idCount + inferredCount) === 1 ? '' : 's') + ' — how many are matched by position, not id</div>' +
             '</div>';
 
         var covStatus = summary.coverage_status || {};
@@ -11548,7 +11742,6 @@ function renderAgenticHtml(d) {
     var autonomy = d.autonomy || {};
     var activity = d.review_activity || {};
     var risk = d.risk_policy || {};
-    var evals = d.evals || {};
     var findings = d.findings || {};
     var qt = d.quality_trend || null;
     var models = d.models || null;
@@ -11797,59 +11990,26 @@ function renderAgenticHtml(d) {
         riskBody +
         '</div>';
 
-    // ================= 4. Eval suite card =================
-    var evalParts = [];
-    if (evals.case_count != null || (evals.cases && evals.cases.length)) {
-        evalParts.push('<div class="text-xs text-qf-text">' + (evals.case_count != null ? evals.case_count : (evals.cases || []).length) + ' cases</div>');
-        var caseChips = (evals.cases || []).map(monoChip).join(' ');
-        if (caseChips) evalParts.push('<div class="flex items-center gap-1.5 flex-wrap">' + caseChips + '</div>');
-    } else {
-        evalParts.push('<div class="text-xs text-qf-muted">no eval case inventory found</div>');
-    }
-    if (evals.thresholds && typeof evals.thresholds === 'object') {
-        var thKeys = Object.keys(evals.thresholds);
-        var thRows = thKeys.map(function(k) {
-            var sub = evals.thresholds[k] || {};
-            var subKeys = Object.keys(sub);
-            var subText = subKeys.map(function(sk) { return sk + ' ' + sub[sk]; }).join(', ');
-            return '<div class="flex items-center gap-2 text-[11px]"><span class="text-qf-text font-mono">' + escapeHtml(k) + '</span>' +
-                '<span class="text-qf-muted">' + escapeHtml(subText) + '</span></div>';
-        }).join('');
-        evalParts.push('<div class="flex flex-col gap-1 pt-2 border-t border-qf-border">' +
-            '<div class="text-[10px] font-semibold uppercase tracking-wider text-qf-muted">Pass thresholds</div>' + thRows + '</div>');
-    }
-    var scorePanel;
-    if (evals.latest_score !== null && evals.latest_score !== undefined) {
-        scorePanel = '<div class="text-xl font-bold text-qf-accent">' + evals.latest_score + '</div>' +
-            '<div class="text-[10px] text-qf-muted">latest run &mdash; single data point, no run history persisted for a trend</div>';
-    } else {
-        scorePanel = noEmitterPanel(evals.score_reason, 'a scored eval run persisted somewhere the dashboard can read (e.g. written alongside eval-smoke\'s CI output)');
-    }
-    evalParts.push('<div class="flex flex-col gap-1.5 pt-2 border-t border-qf-border">' +
-        '<div class="text-[10px] font-semibold uppercase tracking-wider text-qf-muted">Latest score</div>' + scorePanel + '</div>');
-
-    var evalHtml = '<div class="rounded-lg border border-qf-border bg-qf-card p-4 flex flex-col gap-2">' +
-        cardHeader('Eval suite', evals.source ? monoChip(evals.source) : '') +
-        evalParts.join('') +
-        '</div>';
-
     // ================= 5. Findings queue =================
     // /api/metrics/quality-trend replaces the old "nothing emits findings yet"
     // placeholder when it has real data; otherwise fall back to the original
     // noEmitterPanel/findings.available handling unchanged.
     var qtTrend = qt && qt.findings_trend;
-    var qtFtar = qt && qt.ftar;
-    var qtHasData = !!(qtTrend && qtTrend.length) || !!(qtFtar && _ccHasNum(qtFtar.n) && qtFtar.n > 0);
+    var qtRuns = (qt && qt.runs) || [];
+    var qtHasData = !!(qtTrend && qtTrend.length) || qtRuns.length > 0;
     var findingsBody, findingsBadge;
     if (qtHasData) {
-        var ftarPct = (qtFtar && _ccHasNum(qtFtar.value)) ? Math.round(qtFtar.value * 100) + '%' : '—';
-        var ftarTile = '<div class="flex items-center gap-3 pb-2 border-b border-qf-border">' +
-            '<div class="text-xl font-bold text-qf-text tabular-nums">' + ftarPct + '</div>' +
-            '<div class="text-[11px] text-qf-muted">first-time approve' +
-            ((qtFtar && _ccHasNum(qtFtar.n)) ? ' &middot; ' + qtFtar.n + ' run' + (qtFtar.n !== 1 ? 's' : '') : '') + '</div>' +
+        var tot = { critical: 0, major: 0, minor: 0 };
+        qtRuns.forEach(function(r) {
+            var f = r.findings || {};
+            Object.keys(tot).forEach(function(k) { if (_ccHasNum(f[k])) tot[k] += f[k]; });
+        });
+        var countsTile = '<div class="flex items-center gap-3 pb-2 border-b border-qf-border">' +
+            '<div class="text-sm font-bold text-qf-text tabular-nums">' + tot.critical + ' critical &middot; ' + tot.major + ' major &middot; ' + tot.minor + ' minor</div>' +
+            '<div class="text-[11px] text-qf-muted">latest review of ' + qtRuns.length + ' ticket' + (qtRuns.length !== 1 ? 's' : '') + '</div>' +
             '</div>';
         var trendPart = (qtTrend && qtTrend.length) ? findingsTrendHtml(qtTrend) : '<div class="text-xs text-qf-muted">no findings history yet</div>';
-        findingsBody = ftarTile + trendPart;
+        findingsBody = countsTile + trendPart;
         findingsBadge = neutralChip('quality trend');
     } else if (findings.available === false) {
         findingsBody = noEmitterPanel(findings.reason, 'the reviewer to emit structured findings (severity, file:line, confirmed/refuted status) instead of only prose in the review markdown');
@@ -11976,12 +12136,15 @@ function renderAgenticHtml(d) {
         durationsBody +
         '</div>';
 
+    // A card with nothing to show is not shown: a page of "unavailable"
+    // panels read as a broken product, not as an honest empty state.
+    var row = [risk.available ? riskHtml : '', findingsHtml].filter(Boolean);
     return '<div class="flex flex-col gap-4">' +
         autonomyHtml +
         gateHtml +
-        '<div class="grid grid-cols-3 gap-4">' + riskHtml + evalHtml + findingsHtml + '</div>' +
+        '<div class="grid gap-4" style="grid-template-columns:repeat(' + row.length + ',minmax(0,1fr))">' + row.join('') + '</div>' +
         modelsHtml +
-        durationsHtml +
+        (phaseFamilies.length ? durationsHtml : '') +
         '</div>';
 }
     // ===== END workspace screen renderers =====

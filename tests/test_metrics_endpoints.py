@@ -58,67 +58,6 @@ def _write_state(outputs: Path, jira_id: str, doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# confidence
-# ---------------------------------------------------------------------------
-
-def test_confidence_signals_and_insufficiency_rule(outputs):
-    # Rich ticket: STD scenario fully STP<->STD linked (id) + a matching
-    # generated test (coverage=1.0, link_quality=1.0), APPROVED verdicts on
-    # both stp/std via the dashboard-dialect combined phase (review_health),
-    # no refine phase (refinement=1.0 default), python_codegen verification
-    # passed, a fresh `updated` timestamp (freshness=1.0). No ci/test_runs.yaml
-    # -> effectiveness stays unavailable: exactly 6 of 7 signals.
-    jid = "TCNF-1"
-    _write_yaml(outputs / jid / "std" / f"{jid}_test_description.yaml", {
-        "scenarios": [{
-            "test_id": "TS-1", "test_objective": {"title": "Widget works"},
-            "stp_scenario_id": "TS-01", "requirement_ids": ["REQ-1"],
-            "priority": "P1", "test_type": "functional",
-        }],
-    })
-    (outputs / jid / "python-tests").mkdir(parents=True)
-    (outputs / jid / "python-tests" / "qf_widget.py").write_text(
-        'def test_widget():\n    """[TS-1]"""\n    pass\n'
-    )
-    from datetime import datetime, timezone
-    _write_state(outputs, jid, {
-        "jira_id": jid, "project": "tcnf",
-        "updated": datetime.now(timezone.utc).isoformat(),
-        "phases": {
-            "stp": {"status": "completed", "verdict": "APPROVED"},
-            "std": {"status": "completed", "verdict": "APPROVED"},
-            "python_codegen": {"status": "completed", "verification": "passed"},
-        },
-    })
-
-    # Sparse ticket: a bare pending phase, nothing else -> only "refinement"
-    # (always available, defaults to 1.0 when nothing ran) clears the bar.
-    jid2 = "TCNF-2"
-    _write_state(outputs, jid2, {"phases": {"stp": {"status": "pending"}}})
-
-    resp = client.get("/api/metrics/confidence", params={"project": "tcnf"})
-    assert resp.status_code == 200
-    body = resp.json()
-    by_id = {t["jira_id"]: t for t in body["tickets"]}
-
-    rich = by_id[jid]
-    assert rich["signals_total"] == 7
-    assert rich["signals_present"] == 6
-    assert rich["signals"]["effectiveness"]["available"] is False
-    assert rich["signals"]["coverage"] == {"value": 1.0, "available": True}
-    assert rich["signals"]["link_quality"] == {"value": 1.0, "available": True}
-    assert rich["score"] == 100
-    assert rich["band"] == "trusted"
-
-    sparse = by_id[jid2]
-    assert sparse["signals_present"] < 4
-    assert sparse["band"] == "insufficient"
-    assert sparse["score"] is None
-
-    assert body["rollup"]["tickets"] == 2
-
-
-# ---------------------------------------------------------------------------
 # roi
 # ---------------------------------------------------------------------------
 
@@ -277,6 +216,17 @@ def test_beacon_append_and_usage_readback(outputs):
     assert views["runs"]["hits"] == 1
 
 
+def test_usage_counts_viewers_by_name_and_anonymous_views(outputs):
+    client.post("/api/beacon", json={"view": "command", "who": "Alice"})
+    client.post("/api/beacon", json={"view": "runs", "who": "Alice"})
+    client.post("/api/beacon", json={"view": "command"})
+    body = client.get("/api/metrics/usage").json()
+    assert body["viewers"]["Alice"]["hits"] == 2
+    assert body["viewers"]["Alice"]["active_days"] == 1
+    assert body["viewers"]["Alice"]["last_seen"]
+    assert body["anonymous_hits"] == 1
+
+
 def test_beacon_ignores_empty_view(outputs):
     resp = client.post("/api/beacon", json={"view": "  "})
     assert resp.status_code == 200
@@ -288,7 +238,7 @@ def test_beacon_ignores_empty_view(outputs):
 # ---------------------------------------------------------------------------
 
 def test_endpoints_never_500_with_no_data(outputs):
-    for path in ("/api/metrics/confidence", "/api/metrics/roi", "/api/metrics/gaps",
+    for path in ("/api/metrics/roi", "/api/metrics/gaps",
                  "/api/metrics/quality-trend", "/api/metrics/drift", "/api/metrics/usage"):
         resp = client.get(path, params={"project": "nope"})
         assert resp.status_code == 200, f"{path} returned {resp.status_code}: {resp.text}"
@@ -301,7 +251,7 @@ def test_endpoints_never_500_with_no_data(outputs):
 def test_trends_all_merges_projects_by_date(outputs, monkeypatch):
     trends = outputs / "_trends"
     monkeypatch.setattr(ui, "_TRENDS_DIR", trends)
-    _write_yaml(trends / "cnv.yaml", {"history": [
+    _write_yaml(trends / "example.yaml", {"history": [
         {"date": "2026-08-30", "pipelines": 2, "completed": 1, "tests": 10,
          "time_saved_hours": 8.0, "coverage_pct": 60.0, "auto_approved": 1, "human_approved": 0},
     ]})
@@ -397,3 +347,39 @@ def test_time_saved_coeffs_bad_value_falls_back(tmp_path, monkeypatch):
         monkeypatch.delenv(v, raising=False)
     _write_coeff_config(tmp_path, monkeypatch, project_ts={"hours_per_stp": "not-a-number"})
     assert ui._load_time_saved_coeffs("teamx")["hours_per_stp"] == ui._TIME_SAVED_DEFAULTS["hours_per_stp"]
+
+
+# ---------------------------------------------------------------------------
+# time saved credits only accepted work
+# ---------------------------------------------------------------------------
+
+def test_time_saved_skips_a_plan_still_waiting_for_review(outputs):
+    # Both plans are generated; only TTS-1 passed its approval gate.
+    for jid in ("TTS-1", "TTS-2"):
+        (outputs / jid / "stp").mkdir(parents=True)
+        (outputs / jid / "stp" / f"{jid}_test_plan.md").write_text("# plan\n")
+        _write_state(outputs, jid, {"jira_id": jid, "project": "tts",
+                                    "phases": {"stp": {"status": "completed"}}})
+    _write_yaml(outputs / "TTS-1" / "state" / "approvals.yaml",
+                {"stp_review": {"status": "approved", "reviewer": "alice"}})
+    value = client.get("/api/metrics/tts").json()["value"]
+    hours_per_stp = ui._load_time_saved_coeffs("tts")["hours_per_stp"]
+    assert value["artifacts_produced"]["stps"] == 2          # both plans exist
+    assert value["time_saved_hours"] == hours_per_stp        # only the accepted one saved time
+
+
+def test_the_teams_own_stp_earns_no_time_saved(outputs):
+    """stp-builder pulled the STP in from the team's design-docs repo: QF wrote
+    nothing, so it is shown with its source and credited no hours."""
+    jid = "TTS-3"
+    (outputs / jid / "stp").mkdir(parents=True)
+    (outputs / jid / "stp" / f"{jid}_test_plan.md").write_text("# plan\n")
+    _write_yaml(outputs / jid / "stp" / f"{jid}_stp_source.yaml",
+                {"url": "https://github.com/o/d/blob/abc/stps/x.md", "repo": "o/d",
+                 "path": "stps/x.md", "merged": True})
+    _write_state(outputs, jid, {"jira_id": jid, "project": "tts",
+                                "phases": {"stp": {"status": "completed"}}})
+    _write_yaml(outputs / jid / "state" / "approvals.yaml",
+                {"stp_review": {"status": "approved", "reviewer": "merged in o/d"}})
+    assert client.get("/api/metrics/tts").json()["value"]["time_saved_hours"] == 0
+    assert client.get(f"/api/pipelines/{jid}").json()["stp_source"]["repo"] == "o/d"

@@ -20,7 +20,12 @@ Your job is to generate working test implementations from an existing STD.
 
 - `FULLSEND_OUTPUT_DIR` — write all output files here
 - `FULLSEND_TARGET_REPO_DIR` — the QualityFlow project directory
-- `SOURCE_REPO_DIR` — source code repository for LSP analysis (optional)
+- The tests repo checkout (required: without it the suite's fixtures, helpers
+  and markers are unknown, so do not generate) — the directory in the variable
+  named by `primary_repo.local_path_env` in `repositories.yaml`
+  (`SOURCE_REPO_PATH` when unset; `SOURCE_REPO_DIR` is read only as a fallback,
+  old name). Below, `$CHECKOUT` is that directory.
+  <!-- ponytail: SOURCE_REPO_DIR is the old name, read only as a fallback; drop it once no setup exports it. -->
 - `JIRA_TICKET` — the Jira ticket to process
 - `REPO_FULL_NAME` — target repo (e.g., `org/repo`)
 - `TARGET_BRANCH` — PR branch name
@@ -49,7 +54,8 @@ Check that the STD YAML exists at:
 outputs/{JIRA_ID}/std/{JIRA_ID}_test_description.yaml
 ```
 
-If not found, write an error summary and exit.
+If not found, write an error summary and exit. If `SOURCE_REPO_DIR` is unset
+or not a directory, write an error summary ("no tests repo checkout") and exit.
 
 ### Step 2: Read STD and Determine Languages
 
@@ -59,7 +65,17 @@ tier config files for additional context.
 
 ### Step 3: Generate Tests
 
-Invoke the **test-generator** skill with the Jira ID.
+For each target directory (repo-relative, from the STD's
+`code_generation_config`), collect the suite's vocabulary:
+
+```bash
+python3 skills/test-generator/repo_context.py context "$CHECKOUT" {target_dir} --language {python|go}
+```
+
+Invoke the **test-generator** skill with the Jira ID, the checkout and that
+vocabulary. It uses only the fixtures, helpers and markers listed there (or new
+ones the STD defines), never writes a `conftest.py` that redefines a listed
+fixture, and never fakes a suite utility.
 
 The skill:
 
@@ -71,33 +87,28 @@ The skill:
 Then integrate each test into the target repo's existing test suite:
 
 - Put it next to the code under test, following the repo's existing test
-  conventions (naming, package, framework). Keep the `qf_` prefix on new
-  files where the repo's test discovery still picks them up.
+  conventions (naming, package, framework). Name new files
+  `qf_{feature}_test.go` (Go) or `test_qf_{feature}.py` (Python), never
+  `qf_{feature}.py`: pytest's default `python_files` is `test_*.py *_test.py`.
 - Make sure the repo's normal test command runs it. If the repo lists its
   tests explicitly (a Makefile target, CI config), add the file there.
 - If a test cannot be integrated, leave it uncommitted and say so in the
   summary. Do not commit it anywhere else.
 
-For Go: tests must compile with the project's build system.
-For Python: tests must pass `pytest --collect-only`.
-
-### Step 4: Verify Compilation
-
-For Go tests:
+### Step 4: Verify in the Checkout
 
 ```bash
-cd $SOURCE_REPO_DIR
-go vet ./...
+python3 skills/test-generator/repo_context.py verify "$CHECKOUT" <integrated files, repo-relative> \
+  --repos-yaml <config_dir>/repositories.yaml
 ```
 
-For Python tests:
-
-```bash
-cd $SOURCE_REPO_DIR
-python -m pytest --collect-only <integrated test file paths>
-```
-
-Fix any compilation or collection errors.
+It runs the repo's own tooling inside the checkout: `uv run pytest
+--setup-plan -q` (repo has `uv.lock`) or `python -m pytest --setup-plan -q` —
+collection plus every fixture resolved, with the repo entry's `verify:`
+settings —
+and `go vet` plus `go test -run xxx -count=0` per Go package. Fix failures and
+re-run, at most 3 attempts. Keep its `verification` (passed, failed or skipped)
+and `reason` for the summary. It collects or compiles; no test runs.
 
 ### Step 5: Push Output
 
@@ -134,7 +145,9 @@ test_files:
     scenarios: <count>
 test_counts:
   total: <count>
-compilation_verified: true|false
+compilation_verified: true|false   # true only when verification is passed
+verification: passed|failed|skipped
+verification_reason: <reason>      # collection/compilation only, no test was run
 ```
 
 ## Error Handling

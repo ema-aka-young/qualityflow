@@ -39,7 +39,10 @@ single Jira ticket or GitHub issue.
 
 - `FULLSEND_OUTPUT_DIR` — write all output files here
 - `FULLSEND_TARGET_REPO_DIR` — the QualityFlow project directory
-- `SOURCE_REPO_DIR` — source code repository (mounted separately, optional)
+- `SOURCE_REPO_PATH` — source code repository (optional). The variable
+  named by `primary_repo.local_path_env` in `repositories.yaml` wins when it
+  differs; `SOURCE_REPO_DIR` is read only as a fallback (old name).
+  <!-- ponytail: SOURCE_REPO_DIR is the old name, read only as a fallback; drop it once no setup exports it. -->
 - `JIRA_BASE_URL` — Jira instance URL
 - `JIRA_API_TOKEN` — API token for Jira REST calls
 - `JIRA_USER_EMAIL` — email for Jira authentication
@@ -94,13 +97,18 @@ Use `$TICKET_REF` as the ticket identifier everywhere a stage needs one below.
 Invoke the **project-resolver** skill with `$TICKET_REF`.
 
 If `ISSUE_SOURCE` is `github`, the project-resolver will use auto-discovery
-mode (scan `$SOURCE_REPO_DIR` for language markers and test conventions).
+mode (scan `$SOURCE_REPO_PATH` for language markers and test conventions).
 
 Save the returned `project_context` for all subsequent stages.
 
 ### Stage 1: STP Builder
 
 Generate a Software Test Plan from ticket data, PR diffs, and LSP analysis.
+
+**The team's STP comes first.** Before generating, run `commands/stp-builder.md`
+Step 0.5 with the `gh` commands it lists: when the team's design-docs repo already
+has the STP for this ticket, pull it in and use it, and skip generation, review and refinement: continue at Stage 4 (STD Builder) once it is approved.
+
 
 #### 1.1 Jira Data Collection
 
@@ -184,16 +192,19 @@ for producing one.
 #### 1.3 LSP Analysis
 
 If `project_context.feature_toggles.lsp_analysis` is true and
-`$SOURCE_REPO_DIR` exists with a `go.mod`:
+`$SOURCE_REPO_PATH` exists, follow the **lsp-tracer** skill's Step 0: detect
+Go (`go.mod`, gopls) or Python (`pyproject.toml` / `setup.py` / `setup.cfg` /
+`requirements*.txt`, pyright), then:
 
-1. Verify LSP: `LSP documentSymbol` on `go.mod`
+1. Verify LSP: `LSP documentSymbol` on one `.go` / `.py` source file
 2. Find relevant symbols: `LSP documentSymbol` on changed files
 3. Trace references: `LSP findReferences` on key functions
 4. Trace callers: `LSP incomingCalls` up the call chain
 5. Identify existing test coverage
 
 Make at least 3 LSP tool calls. If LSP is unavailable, fall back to
-grep/read analysis.
+grep/read analysis and print one line, repeated verbatim in your final
+summary: `LSP unavailable (<reason>) — used text search`.
 
 #### 1.4 Source Constants Extraction
 
@@ -341,17 +352,22 @@ stage when the review has 0 critical and 0 major findings.
 Generate working test implementations from the STD.
 
 1. Read the STD YAML from `outputs/{JIRA_ID}/std/`
-2. Invoke the **test-generator** skill
-3. For Go: generate working tests that compile with Bazel
-4. For Python: generate working tests that pass `pytest --collect-only`
+2. Require a checkout of the tests repo (`$SOURCE_REPO_DIR`); without one,
+   stop: the suite's fixtures and helpers would be guessed
+3. Collect the suite's vocabulary with
+   `skills/test-generator/repo_context.py context` and invoke the
+   **test-generator** skill with it (`/generate-tests` Steps 3.5-4)
+4. Verify inside the checkout with `repo_context.py verify` (pytest
+   --setup-plan or Go compile; no test runs) and report `verification` and its reason
 
 The skill drafts tests under `outputs/{JIRA_ID}/`. That is a working
 directory: nothing under `outputs/` is committed. Integrate each test into
 the target repo's existing test suite:
 
 - Put it next to the code under test, following the repo's existing test
-  conventions (naming, package, framework). Keep the `qf_` prefix on new
-  files where the repo's test discovery still picks them up.
+  conventions (naming, package, framework). Name new files
+  `qf_{feature}_test.go` (Go) or `test_qf_{feature}.py` (Python), never
+  `qf_{feature}.py`: pytest's default `python_files` is `test_*.py *_test.py`.
 - Make sure the repo's normal test command runs it. If the repo lists its
   tests explicitly (a Makefile target, CI config), add the file there.
 - If a test cannot be integrated, leave it uncommitted and say so in the

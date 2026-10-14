@@ -13,12 +13,14 @@ Operations:
   record-usage <TICKET> <PHASE> --extra YAML|-   # merge usage/model onto a phase, no status change
   fail-phase <TICKET> <PHASE> --error MSG
   check <TICKET> <PHASE>          # prerequisites + approval gates + staleness
+  approve <TICKET> stp|std [--reject] [--by NAME] [--comment TEXT]
   status <TICKET>
 """
 
 import argparse
 import contextlib
 import fcntl
+import getpass
 import hashlib
 import os
 import sys
@@ -61,6 +63,12 @@ MISSING_SUGGESTION = {
     "std_review": "Run `/review-std {t}` to review the STD.",
 }
 
+# codegen's offline check of the generated tests in the tests repo checkout
+# (collect/compile; never a test run). Anything but "passed" leaves the phase
+# completed but unverified, which the dashboard labels experimental.
+VERIFICATION = ("passed", "failed", "skipped")
+RUN_FIELDS = ("verification", "verification_reason")  # describe one run: cleared at its start
+
 DISPLAY = {
     "stp": "STP Generation", "stp_review": "STP Review",
     "stp_refine": "STP Refinement", "std": "STD Generation",
@@ -83,6 +91,17 @@ def outputs_dir():
 
 def state_path(ticket):
     return os.path.join(outputs_dir(), ticket, "state", "pipeline_state.yaml")
+
+
+def scenario_list(ticket):
+    """The ticket's scenario list when it has no STP: std-builder's other input.
+
+    Such a ticket starts at std: there is no STP to complete or approve.
+    """
+    base = os.path.join(outputs_dir(), ticket)
+    listed = os.path.join(base, "input", ticket + "_scenarios.yaml")
+    stp = os.path.join(base, "stp", ticket + "_test_plan.md")
+    return listed if os.path.exists(listed) and not os.path.exists(stp) else None
 
 
 def checksum(path):
@@ -170,12 +189,22 @@ def approval_gates(state):
     return DEFAULT_APPROVAL_GATES
 
 
+def approvals_path(ticket):
+    return os.path.join(outputs_dir(), ticket, "state", "approvals.yaml")
+
+
 def read_approvals(ticket):
-    p = os.path.join(outputs_dir(), ticket, "state", "approvals.yaml")
-    if not os.path.exists(p):
+    """Gate decisions, keyed by gate. The dashboard writes them at the top
+    level; older docs had them under `approvals:`. Both count, the top level
+    winning, so a decision is never invisible to one of the two readers."""
+    p = approvals_path(ticket)
+    doc = load_yaml(p) if os.path.exists(p) else {}
+    if not isinstance(doc, dict):
         return {}
-    doc = load_yaml(p)
-    return doc.get("approvals", doc) if isinstance(doc, dict) else {}
+    wrapped = doc.get("approvals")
+    merged = dict(wrapped) if isinstance(wrapped, dict) else {}
+    merged.update({k: v for k, v in doc.items() if k != "approvals"})
+    return merged
 
 
 def feature_toggles():
@@ -229,11 +258,16 @@ def op_start(args):
     ph["status"] = "in_progress"
     ph["started"] = now_iso()
     ph["error"] = None
+    for k in RUN_FIELDS:
+        ph.pop(k, None)
     save_state(args.ticket, state)
     print("%s: %s -> in_progress" % (args.ticket, args.phase))
 
 
 def op_complete(args):
+    extra = parse_extra(args.extra)
+    if "verification" in extra and extra["verification"] not in VERIFICATION:
+        die("verification must be one of %s, got %r" % (", ".join(VERIFICATION), extra["verification"]))
     state = load_state(args.ticket)
     ph = get_phase(state, args.phase)
     if ph.get("status") != "in_progress":
@@ -249,7 +283,7 @@ def op_complete(args):
             ph["output_checksum"] = checksum(args.output)
         else:
             warn("output file %s not found; checksum not recorded" % args.output)
-    ph.update(parse_extra(args.extra))
+    ph.update(extra)
     save_state(args.ticket, state)
     print("%s: %s -> completed" % (args.ticket, args.phase))
 
@@ -284,13 +318,14 @@ def check_result(state, ticket, phase):
         die("unknown phase %r (valid: %s)" % (phase, ", ".join(PHASES)))
     phases = state["phases"]
     missing, suggestions = [], []
+    from_list = phase == "std" and scenario_list(ticket)
 
-    for pre in PREREQS[phase]:
+    for pre in [] if from_list else PREREQS[phase]:
         if phases.get(pre, {}).get("status") != "completed":
             missing.append(pre)
             suggestions.append(MISSING_SUGGESTION[pre].format(t=ticket))
 
-    gate = GATES.get(phase)
+    gate = None if from_list else GATES.get(phase)
     if gate and gate in approval_gates(state) and gate not in missing:
         status = (read_approvals(ticket).get(gate) or {}).get("status")
         label = "STP Review" if gate == "stp_review" else "STD Review"
@@ -304,13 +339,23 @@ def check_result(state, ticket, phase):
             missing.append(gate + " (awaiting approval)")
             suggestions.append(
                 "%s is awaiting human approval. Approve the reviewed artifact "
-                "from the dashboard, or record it in "
-                "%s/%s/state/approvals.yaml." % (label, outputs_dir(), ticket))
+                "from the dashboard, or run `/approve %s %s`."
+                % (label, ticket, gate.split("_")[0]))
 
     result = {"valid": not missing, "stale": False}
     if missing:
         result["missing"] = missing
         result["suggestion"] = " ".join(suggestions)
+
+    std = phases.get("std", {})
+    listed, stored = std.get("scenario_list"), std.get("scenario_list_checksum_at_generation")
+    if phase in ("std_review", "codegen") and listed and stored and os.path.exists(listed) \
+            and checksum(listed) != stored:
+        result["stale"] = True
+        result["stale_file"] = listed
+        result["stale_reason"] = ("the scenario list changed after the STD was generated from it; "
+                                  "re-run /std-builder %s" % ticket)
+        return result
 
     upstream = STALE_UPSTREAM.get(phase)
     if upstream:
@@ -334,19 +379,41 @@ def op_check(args):
     sys.exit(0 if result["valid"] else 1)
 
 
+def op_approve(args):
+    gate = {"stp": "stp_review", "std": "std_review"}[args.doc]
+    state = load_state(args.ticket, required=False)
+    gates = approval_gates(state) if state else DEFAULT_APPROVAL_GATES
+    if gate not in gates:
+        die("%s is not an approval gate for this project (gates: %s)"
+            % (gate, ", ".join(gates) or "none"))
+    review = ((state or {}).get("phases") or {}).get(gate) or {}
+    if review.get("status") != "completed":
+        warn("%s has no completed review yet; recording the decision anyway" % gate)
+    approvals = read_approvals(args.ticket)
+    approvals[gate] = {
+        "status": "rejected" if args.reject else "approved",
+        "reviewer": args.by or getpass.getuser(),
+        "comment": args.comment or "",
+        "timestamp": now_iso(),
+    }
+    atomic_write(approvals_path(args.ticket), approvals)  # flat, as the dashboard writes it
+    print("%s: %s %s" % (args.ticket, gate, approvals[gate]["status"]))
+
+
 def next_step(state, ticket):
     phases = state["phases"]
 
     def st(p):
         return phases.get(p, {}).get("status")
 
-    if st("stp") != "completed":
-        return "Run `/stp-builder %s`" % ticket
-    if st("stp_review") != "completed":
-        return "Run `/review-stp %s`" % ticket
-    if phases.get("stp_review", {}).get("verdict") == "NEEDS_REVISION" \
-            and st("stp_refine") != "completed":
-        return "Run `/refine-stp %s`" % ticket
+    if not scenario_list(ticket):
+        if st("stp") != "completed":
+            return "Run `/stp-builder %s`" % ticket
+        if st("stp_review") != "completed":
+            return "Run `/review-stp %s`" % ticket
+        if phases.get("stp_review", {}).get("verdict") == "NEEDS_REVISION" \
+                and st("stp_refine") != "completed":
+            return "Run `/refine-stp %s`" % ticket
     if st("std") != "completed":
         return "Run `/std-builder %s`" % ticket
     if st("std_review") != "completed":
@@ -378,6 +445,9 @@ def op_status(args):
             if f:
                 details += " (%sC, %sM, %sm)" % (f.get("critical", 0),
                                                  f.get("major", 0), f.get("minor", 0))
+        elif info.get("verification"):
+            details = "verification: %s" % info["verification"] + (
+                " (%s)" % info["verification_reason"] if info.get("verification_reason") else "")
         elif info.get("error"):
             details = "error: %s" % info["error"]
         elif isinstance(info.get("output"), str) and "\n" not in info["output"]:
@@ -437,8 +507,16 @@ def self_test():
         main(["start-phase", t, "stp_review"])
         main(["complete-phase", t, "stp_review", "--extra",
               "verdict: APPROVED\nfindings: {critical: 0, major: 0, minor: 0}"])
+        # an old hand-written file (under `approvals:`) still counts
         atomic_write("outputs/%s/state/approvals.yaml" % t,
                      {"approvals": {"stp_review": {"status": "approved"}}})
+        assert check_result(load_state(t), t, "std")["valid"]
+        main(["approve", t, "stp", "--reject", "--by", "qe", "--comment", "redo II.5"])
+        doc = load_yaml("outputs/%s/state/approvals.yaml" % t)
+        assert "approvals" not in doc and doc["stp_review"]["status"] == "rejected", doc
+        assert doc["stp_review"]["reviewer"] == "qe" and doc["stp_review"]["comment"] == "redo II.5"
+        assert "stp_review (rejected)" in check_result(load_state(t), t, "std")["missing"]
+        main(["approve", t, "stp"])
         r = check_result(load_state(t), t, "std")
         assert r["valid"], r
 
@@ -448,6 +526,40 @@ def self_test():
         open(out, "a").write("edited\n")
         r = check_result(load_state(t), t, "std_review")
         assert r["stale"], r
+
+        # A scenario list and no STP: std needs neither stp nor its approval.
+        t2 = "TEST-2"
+        main(["init", t2, "--project-id", "example", "--display-name", "Example"])
+        assert not check_result(load_state(t2), t2, "std")["valid"]
+        os.makedirs("outputs/%s/input" % t2, exist_ok=True)
+        open("outputs/%s/input/%s_scenarios.yaml" % (t2, t2), "w").write("scenarios: []\n")
+        assert check_result(load_state(t2), t2, "std")["valid"]
+        assert next_step(load_state(t2), t2) == "Run `/std-builder %s`" % t2
+        listed = "outputs/%s/input/%s_scenarios.yaml" % (t2, t2)
+        main(["start-phase", t2, "std"])
+        main(["complete-phase", t2, "std", "--extra",
+              '{"scenario_list": "%s", "scenario_list_checksum_at_generation": "%s"}'
+              % (listed, checksum(listed))])
+        assert next_step(load_state(t2), t2) == "Run `/review-std %s`" % t2
+        assert not check_result(load_state(t2), t2, "std_review")["stale"]
+        open(listed, "a").write("# edited\n")
+        assert check_result(load_state(t2), t2, "std_review")["stale"]
+
+        # codegen records its offline verification; a bad value is refused,
+        # and the next run starts without the previous run's result.
+        main(["start-phase", t2, "codegen"])
+        main(["complete-phase", t2, "codegen", "--extra",
+              '{"test_count": 3, "verification": "skipped", "verification_reason": "uv is not installed"}'])
+        gc = load_state(t2)["phases"]["codegen"]
+        assert (gc["status"], gc["verification"], gc["test_count"]) == ("completed", "skipped", 3), gc
+        try:
+            main(["complete-phase", t2, "codegen", "--extra", '{"verification": "ok"}'])
+            raise AssertionError("an unknown verification value was accepted")
+        except SystemExit as e:
+            assert e.code == 2
+        assert load_state(t2)["phases"]["codegen"]["verification"] == "skipped"
+        main(["start-phase", t2, "codegen"])
+        assert "verification" not in load_state(t2)["phases"]["codegen"]
 
         # fail-phase records error, no completed timestamp
         main(["start-phase", t, "codegen"])
@@ -510,6 +622,14 @@ def main(argv=None):
     p = sub.add_parser("status")
     p.add_argument("ticket")
     p.set_defaults(fn=op_status)
+
+    p = sub.add_parser("approve")
+    p.add_argument("ticket")
+    p.add_argument("doc", choices=["stp", "std"])
+    p.add_argument("--reject", action="store_true")
+    p.add_argument("--by", help="reviewer name (default: the OS user)")
+    p.add_argument("--comment")
+    p.set_defaults(fn=op_approve)
 
     args = parser.parse_args(argv)
     if args.self_test:

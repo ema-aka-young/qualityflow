@@ -27,6 +27,7 @@ optional_directories:
   - patterns/            # Project-specific pattern rules
   - reference/           # Project-specific reference test files
   - templates/           # Project-specific code/document templates
+  - polarion-migration/  # A team's Polarion migration profile and team map (on the team's own branch)
 
 # Validation rules
 validation:
@@ -44,6 +45,7 @@ validation:
       - scope_boundaries
       - review_sla              # PR review-cycle SLAs; see _defaults.yaml for the keys
       - scenario_tiers          # auto mode: label scenarios [Tier N] instead of by test type (list of {tier, description, marker?})
+      - stakeholders            # STP Section IV: {default_reviewers: [], default_approvers: []}, each {name, github?, role?}
 
   repositories_yaml:
     required_fields:
@@ -53,6 +55,7 @@ validation:
     optional_fields:
       - design_docs_repo
       - repo_files
+      - primary_repo.verify       # {env, args}: what the repo's CI sets to collect offline (/generate-tests)
 
   components_yaml:
     required_fields:

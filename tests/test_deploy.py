@@ -116,6 +116,10 @@ def test_codex_target_lands_skills_prompts_and_toml_agents(tmp_path, monkeypatch
 
     assert (home / ".agents" / "skills" / "demo-skill" / "SKILL.md").exists()
     assert (home / ".codex" / "prompts" / "one.md").exists()
+    # Codex CLI no longer lists custom prompts; each command is a $skill too.
+    skill = (home / ".agents" / "skills" / "one" / "SKILL.md").read_text()
+    assert skill.startswith('---\nname: "one"\ndescription: ')
+    assert "$ARGUMENTS below means the text the user wrote after `$one`" in skill
     agent = tomllib.loads((home / ".codex" / "agents" / "alpha.toml").read_text())
     assert agent == {"name": "alpha", "description": 'Say "hi"',
                      "developer_instructions": "# Body\n"}
@@ -136,6 +140,67 @@ def test_codex_project_scope_skips_prompts(tmp_path, monkeypatch):
     assert (proj / ".agents" / "skills" / "demo-skill" / "SKILL.md").exists()
     assert (proj / ".codex" / "agents" / "alpha.toml").exists()
     assert not (proj / ".codex" / "prompts").exists()
-    assert "commands skipped" in output
+    assert (proj / ".agents" / "skills" / "one" / "SKILL.md").exists()
+    assert "deployed as skills instead" in output
     assert (proj / ".claude" / "commands" / "one.md").exists()
     assert (proj / ".cursor" / "agents" / "alpha.md").exists()
+
+
+def test_skill_bytecode_caches_are_not_deployed(tmp_path):
+    """__pycache__ left by local test runs was copied into every target's skills."""
+    src = make_source(tmp_path)
+    skill = src / "skills" / "demo-skill"
+    (skill / "helper.py").write_text("x = 1\n")
+    (skill / "__pycache__").mkdir()
+    (skill / "__pycache__" / "helper.cpython-311.pyc").write_bytes(b"\0")
+    dest = tmp_path / "dest"
+    copied = deploy.copy_skill_directory(skill, dest, dry_run=False)
+    assert sorted(p.name for p in (dest / "demo-skill").rglob("*")) == ["SKILL.md", "helper.py"]
+    assert sorted(d.name for _, d in copied) == ["SKILL.md", "helper.py"]
+
+
+def test_claude_deploy_enables_lsp_plugins_idempotently(tmp_path, monkeypatch):
+    """LSP was on by default in config but nothing turned the Claude Code
+    plugins on, so runs silently fell back to grep. Deploy enables them, keeps
+    every existing key (including an explicit opt-out), and is a no-op twice."""
+    src, home = make_source(tmp_path), make_home(tmp_path, monkeypatch)
+    settings = home / ".claude" / "settings.json"
+    settings.write_text(json.dumps({"model": "x", "enabledPlugins": {
+        "pyright-lsp@claude-plugins-official": False}}))
+
+    out = run(src, "--dry-run")
+    assert "Would enable" in out and "gopls-lsp@claude-plugins-official" in out
+    assert "gopls" not in settings.read_text()  # dry run writes nothing
+
+    run(src)
+    data = json.loads(settings.read_text())
+    assert data["model"] == "x"
+    assert data["enabledPlugins"] == {"pyright-lsp@claude-plugins-official": False,
+                                      "gopls-lsp@claude-plugins-official": True}
+    assert data["env"] == {"ENABLE_LSP_TOOL": "1"}
+    assert "nothing to do" in run(src)
+
+
+def test_project_scope_enables_lsp_in_project_settings(tmp_path, monkeypatch):
+    """The image deploys --scope project; dashboard runs get a fresh
+    CLAUDE_CONFIG_DIR, so the project settings are what carry LSP over."""
+    src, _ = make_source(tmp_path), make_home(tmp_path, monkeypatch)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    run(src, "--scope", "project", "--project-path", str(proj))
+    data = json.loads((proj / ".claude" / "settings.json").read_text())
+    assert data["enabledPlugins"]["gopls-lsp@claude-plugins-official"] is True
+
+
+def test_lsp_settings_left_alone_when_unparseable(tmp_path, monkeypatch):
+    src, home = make_source(tmp_path), make_home(tmp_path, monkeypatch)
+    settings = home / ".claude" / "settings.json"
+    settings.write_text("{not json")
+    assert "LSP plugins not enabled" in run(src)
+    assert settings.read_text() == "{not json"
+
+
+def test_cursor_only_deploy_does_not_touch_claude_settings(tmp_path, monkeypatch):
+    src, home = make_source(tmp_path), make_home(tmp_path, monkeypatch)
+    run(src, "--target", "cursor")
+    assert not (home / ".claude" / "settings.json").exists()

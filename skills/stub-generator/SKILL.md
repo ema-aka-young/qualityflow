@@ -75,9 +75,11 @@ Load `outputs/{JIRA_ID}/std/{JIRA_ID}_test_description.yaml`
 ### Step 2: Discover Language Targets
 
 **Auto-discovery guard:** If `project_context.config_dir` is null (auto-discovered
-project), read the `code_generation_config` section from the STD YAML instead of
-scanning config files. The STD YAML already contains language, framework, and import
-information populated by the test-strategy-resolver during STD generation. Skip the
+project), or the project runs in auto mode (`test_strategy: "auto"`, so it has no
+`tier*.yaml`), read the `code_generation_config` section from the STD
+YAML instead of scanning config files. The STD YAML already contains language, framework, and import
+information, which std-generator filled in (from test-strategy-resolver, or for a scenario
+list from the project's `repositories.yaml`). Skip the
 config file scan entirely and build the language target map from STD metadata.
 
 **When config_dir is available:** Scan `{project_context.config_dir}/` for YAML files with
@@ -205,13 +207,11 @@ Phase 1 stubs are **design-only**. The following MUST NOT appear:
 
 - No fixture/helper definitions
 - No framework-specific decorators or annotations
-  **Exceptions:** `@pytest.mark.polarion("PLACEHOLDER")` when `polarion: true`;
-  `@pytest.mark.qf_test_id("TS-...")` always (QualityFlow's own scenario id,
-  independent of Polarion — see Python `pytest` section below)
+  **Exception:** `@pytest.mark.polarion("PLACEHOLDER")` when `polarion: true`.
+  Never `@pytest.mark.qf_test_id` — see **Stub Identity (Python)** below
 - No fixture/helper parameters in test signatures
 - No framework imports beyond the minimum needed for the stub pattern
-  **Exception:** `import pytest` — always needed, for the `qf_test_id` decorator
-  (and for `polarion` too, when `polarion: true`)
+  **Exception:** `import pytest` when `polarion: true`, for that placeholder
 - No PR references (PRs are STP-level context, not STD)
 - No block comments above tests (all info in docstrings/PSE comments)
 - No fixture names in Preconditions (use descriptive requirements)
@@ -357,7 +357,6 @@ When `framework: "pytest"` in the language config:
 STP: {STP_URL}
 Jira: {JIRA_ID}
 """
-import pytest
 
 
 class TestFeatureName:
@@ -376,7 +375,6 @@ class TestFeatureName:
     """
     __test__ = False
 
-    @pytest.mark.qf_test_id("TS-{ID}-001")
     def test_specific_behavior(self):
         """
         Test that {specific ONE thing being verified}. [TS-{ID}-001]
@@ -404,15 +402,14 @@ class TestFeatureName:
 - `__test__ = False` on class level (grouped tests) or after function (standalone)
 - Test methods: PSE docstring as function body (no `pass` — docstring is sufficient)
 - `def test_foo(self):` — no fixture parameters in signature
-- No `@pytest.fixture`, no other `@pytest.mark.*` decorators beyond the two exceptions below
-  **Exceptions:**
-  - `import pytest` + `@pytest.mark.qf_test_id("TS-{ID}-{NNN}")` — always, on every
-    test method/function. Mirrors the `[test_id:TS-XXX]` tag Go stubs already embed
-    in `PendingIt()`; the docstring `[TS-{ID}-{NNN}]` tag stays too (belt and suspenders
-    for a design-only stub). This is a **QualityFlow marker, not a Polarion one** — it
-    applies whether or not `polarion` is enabled.
-  - `@pytest.mark.polarion("PLACEHOLDER")` when `polarion: true` in project config
-    (stacks with `qf_test_id`, does not replace it)
+- No `@pytest.fixture` and no `@pytest.mark.*` decorator, with one exception:
+  `@pytest.mark.polarion("PLACEHOLDER")` when `polarion: true` in project config.
+  Only then does the stub `import pytest`. A scenario with a `polarion_id` gets
+  no polarion decorator at all: its real id goes under the test docstring's
+  `Markers:`. See **Polarion Marker** below.
+- The scenario id is the `[TS-{ID}-{NNN}]` tag that ends the docstring's first
+  line, on every test, whether or not `polarion` is enabled. Never a
+  `@pytest.mark.qf_test_id` decorator. See **Stub Identity (Python)** below.
 - **STP URL resolution:** When `stp_reference.url` exists in the STD YAML metadata
   (set by std-orchestrator when the STP has been merged into the design-docs repo),
   use that URL as `{STP_URL}`. Otherwise fall back to the local file path from
@@ -420,29 +417,34 @@ class TestFeatureName:
   the output directory is cleaned up.
   **No STP at all** (smaller features, bug fixes, and STDs built from inputs other
   than an STP): omit the `STP:` line entirely and use `Jira: {JIRA_URL}` in its
-  place, in the module header and in every test. One of the two is always
-  present — never emit an `STP:` line with an empty or placeholder value.
-- `python` marker is implicit (NOT listed) — only list non-auto markers (e.g., `gating`, `arm64`)
+  place, in the module header (one `Jira:` line, replacing both lines of the
+  template above) and in every test. `{JIRA_URL}` is
+  `document_metadata.jira_url`. A test whose scenario has its own `jira_url`
+  links that one instead, which is how a case migrated from Polarion links its
+  own requirement. One of the two keywords is always present. Never emit an
+  `STP:` line with an empty or placeholder value.
 - Markers documented in docstring `Markers:` section only.
   **Include ONLY markers that will become real `@pytest.mark.*` decorators in Phase 2.**
   Priority values (P0/P1/P2) are NOT markers — they are STD metadata.
-  Tier classification (tier2, end_to_end) is implicit — do NOT list it.
+  Markers the target suite adds by itself are implicit — do NOT list them. Its
+  rules (`repo_rules.agents_rules`) say which, typically a default tier marker or
+  team markers derived from the test's directory.
   **Exception:** a scenario whose STD entry carries a `marker` (from the project's
-  `scenario_tiers`, e.g. CNV Tier 3 → `tier3`) MUST list it. In
-  openshift-virtualization-tests every test without such a marker is collected as
-  tier2 and runs in the standard lane.
-  Team/SIG markers (storage, network, compute) are implicit — do NOT list them.
+  `scenario_tiers`, e.g. a Tier 3 that maps to `tier3`) MUST list it. In a suite
+  that gives every unmarked test its default tier, a test without that marker
+  runs in the default lane.
+  **Exception:** a scenario with a `polarion_id` MUST list `polarion("{polarion_id}")`
+  under its test's `Markers:` (see **Polarion Marker**).
   If no non-implicit markers apply, **omit the `Markers:` section entirely**.
 - Parametrize documented in docstring `Parametrize:` section only
-- `[NEGATIVE]` prefix for failure scenario tests
+- `[NEGATIVE]` prefix for failure scenario tests: tests whose Expected outcome is
+  that the action fails or is refused ("Ping fails with 100% packet loss",
+  "Request is rejected"). Decide from the Expected outcome, not from words in
+  the title: "Service recovers after a node failure" is not negative.
 
 **Standalone test (no class needed):**
 
 ```python
-import pytest
-
-
-@pytest.mark.qf_test_id("TS-{ID}-001")
 def test_specific_behavior():
     """
     Test that {specific ONE thing being verified}. [TS-{ID}-001]
@@ -461,6 +463,24 @@ test_specific_behavior.__test__ = False
 
 **Output:** `outputs/{JIRA_ID}/std/python-tests/test_{feature}_stubs.py`
 
+### Stub Identity (Python)
+
+A Python stub carries its scenario id only as the `[TS-{ID}-{NNN}]` tag in its
+docstring, the counterpart of Go's `[test_id:TS-XXX]` label. It never carries
+`@pytest.mark.qf_test_id`:
+
+- `__test__ = False` does not stop pytest importing the module (that is how it
+  reads `__test__`), and the import runs every decorator. An unregistered mark
+  then fails collection under `--strict-markers`, and a tests repo whose CI runs
+  `pytest --collect-only` fails that check on every PR that adds a stub. Without
+  `--strict-markers` it is an unknown-marker warning instead.
+- A stub is never collected, so pytest would never report the mark anyway.
+
+The **test-generator** adds the real decorator, and registers it, when it
+implements the test in Phase 2. validate_std.py fails a stub that carries the
+decorator (`stubs.qf_test_id_marker`), and a test whose docstring has no tag
+(`stubs.test_id_tag`).
+
 ### Additional Tiers
 
 Each tier routes to whatever language and framework its `tier*.yaml` config
@@ -470,18 +490,39 @@ stubs in that config's language.
 
 ### Repo Rules Integration (Python)
 
-When `project_context.repo_rules` is available, the following rules
-from the target repository's AGENTS.md **override** defaults:
+When `project_context.repo_rules` holds the target repository's own rules
+(`agents_rules`, `std_format`), they **override** the defaults in this skill.
+Apply what they state: markers the suite adds by itself (never written, not even
+under `Markers:`), forbidden constructs, fixture naming, where helpers may live,
+how dependent tests are declared. Assume no rule a fetched file does not state.
 
-- **`python` is implicit** — Do NOT add `@pytest.mark.python`. Do NOT
-  include `python` in the Markers docstring section.
-- **Team markers are implicit** — project-specific team markers are added
-  automatically. Do NOT add them explicitly.
-- **`pytest.skip/skipif` are forbidden** — Do not use in generated code.
-- **`@pytest.mark.incremental`** for dependent tests within a class.
-- **Fixture names must be nouns** — `resource_with_storage`, not `create_resource_with_storage`.
-- **conftest.py is for fixtures only** — No helpers in conftest.
-- **STP link required in module docstring.**
+One rule holds either way: the STP link, or the RFE/Jira link when there is no
+STP, in the module, class or test docstring. These stubs carry it in the module
+docstring and in every test (see **STP Traceability**), under the `STP:` /
+`Jira:` keyword even where a fetched guide's examples write `STP Reference:`.
+
+### Polarion Lint (Conditional — Python)
+
+When `polarion_lint: true` in the project's feature toggles, end every
+`def test_*` line with `  # noqa: PID001`:
+
+```python
+    def test_specific_behavior(self):  # noqa: PID001
+```
+
+Turn it on for a tests repo that runs the RedHatQE flake8 PolarionIds plugin
+(`enable-extensions = PID` in its `.flake8`). The plugin reports PID001 on every
+test function without `@pytest.mark.polarion("PROJ-<n>")`, `__test__ = False` stubs
+included. No decorator fits a stub: the plugin rejects `"PLACEHOLDER"` (PID002), so
+leave the `polarion` toggle off, and a real id lets the repo's Polarion sync (a
+post-merge job, for example) mark the case Automated while the test is still a stub.
+
+- The noqa goes on the `def` line, where the plugin reports. On a decorator line
+  it suppresses nothing.
+- Never a file-level `# flake8: noqa: PID001`: flake8 reads any `# flake8: noqa`
+  line as "skip this file", which turns off every other check too.
+- The Phase 2 change that implements the test adds its real Polarion decorator
+  and drops the noqa.
 
 ### Class-Level Preconditions (Python)
 
@@ -494,20 +535,25 @@ Do NOT include:
 - Platform prerequisites (platform version, product version, operator installations)
 
 Tests assume the test environment described in the STP is already in place.
-Tests that share the same setup MUST be grouped in one class.
+Tests that share the same setup MUST be grouped in one class. "Same setup" means
+the same class-level Preconditions: the same resources, created the same way. A
+test that needs a shared resource in another state (stopped rather than
+running) stays in the class and states that state in its own `Preconditions:`.
+Tests that need a differently created resource (another spec, another network)
+go in another class, or stand alone.
 
 **Shared Resource Repetition Rule:** When a test method's Steps or Expected
 reference a resource declared in the shared (class-level) Preconditions, that
 resource MUST also appear in the test method's own `Preconditions:` section.
-This follows the repo convention: "When a shared resource (e.g., a VM) is
+This follows the repo convention: "When a shared resource (e.g., a database) is
 directly used by a test, it must appear in both the shared and test-level
 preconditions."
 
 Use functional language for the repeated precondition — describe the state,
 not the mechanism:
 
-- GOOD: `Preconditions:\n  - VM with Velero backup hooks disabled`
-- BAD: `Preconditions:\n  - VM with per-VM opt-out annotation set`
+- GOOD: `Preconditions:\n  - Resource with backup hooks disabled`
+- BAD: `Preconditions:\n  - Resource with per-resource opt-out annotation set`
 
 ### Precondition Abstraction Rule (Python)
 
@@ -517,25 +563,24 @@ as the STP Pre-Writing Abstraction Pass:
 
 | Implementation Language | Functional Language |
 |-------------------------|---------------------|
-| "per-VM opt-out annotation" | "VM with backup hooks disabled" |
+| "per-resource opt-out annotation" | "resource with backup hooks disabled" |
 | "CRD with spec.sourcePartition set" | "restore request targeting a specific partition" |
 | "controller reconciles the CR" | "restore request is processed" |
 | "rsync connection established" | "file transfer connection ready" |
-| "filerestore.sh helper deployed" | "restore helper available on target VM" |
+| "filerestore.sh helper deployed" | "restore helper available on target resource" |
 
 This applies to BOTH shared (class-level) and test-specific preconditions.
 
 ### Polarion Marker (Conditional — Python)
 
-`@pytest.mark.qf_test_id("TS-{ID}-{NNN}")` is generated unconditionally (see the
-Framework: Python `pytest` section above) — it is QualityFlow's own marker, not
-Polarion's, so it is unaffected by this toggle.
+The `[TS-{ID}-{NNN}]` docstring tag is QualityFlow's own id, not Polarion's, so
+this toggle does not affect it (see **Stub Identity (Python)** above).
 
-When `polarion: true` in the project's feature toggles, every test function ALSO
-gets a `@pytest.mark.polarion("PLACEHOLDER")` decorator, stacked above `qf_test_id`.
-These are the **only two** `@pytest.mark` decorators allowed in Phase 1 stubs.
+When `polarion: true` in the project's feature toggles, every test function gets
+a `@pytest.mark.polarion("PLACEHOLDER")` decorator. It is the **only**
+`@pytest.mark` decorator allowed in Phase 1 stubs.
 
-**When enabled**, stack both decorators on every test:
+**When enabled**, decorate every test:
 
 ```python
 import pytest
@@ -546,7 +591,6 @@ class TestFeatureName:
     __test__ = False
 
     @pytest.mark.polarion("PLACEHOLDER")
-    @pytest.mark.qf_test_id("TS-{ID}-001")
     def test_specific_behavior(self):
         """
         Test that {specific ONE thing being verified}. [TS-{ID}-001]
@@ -558,38 +602,85 @@ For standalone tests:
 
 ```python
 @pytest.mark.polarion("PLACEHOLDER")
-@pytest.mark.qf_test_id("TS-{ID}-001")
 def test_standalone_behavior():
     """..."""
 
 test_standalone_behavior.__test__ = False
 ```
 
-**When `polarion: false`** (or not set): Do NOT add the `polarion` marker.
-`import pytest` and `@pytest.mark.qf_test_id(...)` are still generated — they
-do not depend on this toggle.
+**When `polarion: false`** (or not set): Do NOT add the `polarion` marker, and
+do not import pytest.
 
 The `"PLACEHOLDER"` value is intentional — it will be replaced with the actual Polarion
 test case ID during Phase 2 implementation or by CI tooling.
 
+**A scenario with a `polarion_id`** (a case migrated from Polarion) lists its
+real id under the test docstring's `Markers:` section, **whatever the toggle
+says**:
+
+```python
+    def test_specific_behavior(self):
+        """
+        Test that {specific ONE thing being verified}. [TS-{ID}-001]
+
+        Jira: {the scenario's jira_url}
+
+        Markers:
+            - polarion("PROJ-12345")
+
+        Preconditions:
+        ...
+        """
+```
+
+It gets **no** `@pytest.mark.polarion` decorator, not even the placeholder. A
+repo's sync job can mark a case Automated as soon as a merged line carries
+`pytest.mark.polarion("{id}")`, and a design stub is not automated. (The
+Polarion migration's `package` step renders the team's own form from this one:
+its profile's mark name and carrier.) The Phase 2 PR that implements the test turns the entry into
+the real decorator, as it does for every `Markers:` entry. The entry is what
+traces the stub back to the Polarion case it replaces: validate_std.py fails a
+stub without it, and a stub that carries a live `pytest.mark.polarion` with a
+real id.
+
+**A scenario with a non-empty `source_missing`** (the source system had no
+preconditions, steps or expected result; `source_pse` is then `partial` or
+`missing`), **or with a `review_note`**, gets one more docstring line, right
+after its `Jira:` line, so a reviewer can tell copied wording from proposed or
+corrected wording:
+
+```
+Source: Polarion PROJ-12345 lists no steps; the Steps below are proposed.
+```
+
+Name every section the scenario's `source_missing` lists (`preconditions`,
+`steps`, `expected`) and say they are proposed. When the scenario has a
+`review_note` (a correction from the team's review), apply it and say so in the
+same line, e.g. "Steps corrected in team review". validate_std.py fails a stub
+whose `Source:` line misses one of these.
+
+**A migrated case is always one stub,** even when its source lists several
+expected results: list them all under `Expected:` (the repo's STD guide allows
+several assertions that verify one behaviour). This is the one exception to the
+Single-Expected Rule below. Never split a migrated case: its Polarion id belongs
+to exactly one test. When the scenario has `step_results`, an expected result
+that belongs to one step names it: `- (step 2) The service is running`.
+
 **Enforcement:** When `polarion: true`, the stub-generator MUST NOT output any
 Python test stub file without `import pytest` at the top and
-`@pytest.mark.polarion("PLACEHOLDER")` on every `def test_*` function. Omitting
+`@pytest.mark.polarion("PLACEHOLDER")` on every `def test_*` function whose
+scenario has no `polarion_id`. Omitting
 the marker is a generation error — Polarion-integrated projects require it for
-test case traceability. `@pytest.mark.qf_test_id(...)` is required regardless
-of the Polarion toggle — omitting it is always a generation error.
+test case traceability. The `[TS-...]` docstring tag is required regardless of
+the Polarion toggle — omitting it is always a generation error.
 
-**Marker registration:** Phase 1 stubs are excluded from collection
-(`__test__ = False`), so pytest never evaluates the `qf_test_id` mark against
-its registry here — no unknown-marker warning at this phase. The
-`pytest_configure` registration hook lives in the `conftest.py` the
-**test-generator** skill produces in Phase 2, once the tests are real and
-collected. See `test-generator` SKILL.md's Python `pytest` section.
+### Dependent Tests (Python)
 
-### Dependent Tests (Incremental — Python)
-
-When tests within a class depend on execution order, use `@pytest.mark.incremental`
-in the class Markers docstring section:
+When tests within a class depend on execution order, list the target suite's own
+dependency marker in the class `Markers:` section, the one its rules name
+(`repo_rules`). A marker the suite does not register fails collection under
+`--strict-markers`, so when its rules name none, keep the tests independent
+instead. With `incremental` as the suite's marker:
 
 ```python
 class TestSomeFeature:
@@ -616,10 +707,11 @@ class TestSomeFeature:
 ## Polarion Toggle
 
 If `project_context.feature_toggles.polarion` is false, omit Polarion
-marker references from stubs (both Go and Python). This does NOT affect
-`@pytest.mark.qf_test_id(...)` or Go's `[test_id:TS-XXX]` label — those are
-QualityFlow's own scenario-id markers, independent of Polarion, and are
-always generated.
+marker references from stubs (both Go and Python). This does NOT affect the
+Python docstring `[TS-XXX]` tag or Go's `[test_id:TS-XXX]` label — those are
+QualityFlow's own scenario ids, independent of Polarion, and are always
+generated. Nor does it affect the `Markers:` entry of a scenario with a
+real `polarion_id` (see **Polarion Marker**).
 
 ---
 
@@ -662,11 +754,15 @@ overall expected result. The individual assertions inform the implementation (Ph
 not the design (Phase 1).
 
 - WRONG: `Expected:\n  - Backup completes with status Completed\n  - No hooks executed`
-- RIGHT: `Expected: Backup completes successfully without hook execution`
+- RIGHT: `Expected:\n  - Backup completes successfully without hook execution`
+
+Write the one statement as a single bullet, the form the templates above use.
 
 If multiple assertions test genuinely different aspects, that is a signal that the
 scenario should be split into separate tests (one per aspect). Flag this during
-generation and produce separate stubs.
+generation and produce separate stubs. **Exception:** a migrated case (a scenario
+with a `polarion_id`) keeps every expected result its source lists, in one stub
+(see **Polarion Marker**).
 
 **Baseline vs Outcome verification:**
 
@@ -710,11 +806,17 @@ Same keyword and same value as the module header (`stp_reference.url`, falling
 back to `stp_reference.file`), so a grep for `STP:` finds every test.
 
 When the STD has no STP, the per-test line is `Jira: {JIRA_URL}` instead —
-same placement, same rule: every test carries exactly one of the two.
+same placement, same rule: every test carries exactly one of the two. The URL
+is the scenario's own `jira_url` when it has one (a case migrated from Polarion
+links its own requirement), otherwise `document_metadata.jira_url`.
+When the tests repo's rules ask for a comment after a Jira link (a link
+checker's skip marker, such as `# <skip-link-check>` for a closed Jira),
+end every `Jira:` line, module header included, with it:
+`Jira: {JIRA_URL}  # <skip-link-check>`. Nothing else may follow the URL.
 
-The `[TS-{ID}-{NNN}]` tag and `@pytest.mark.qf_test_id(...)` marker remain the
-stable identity: the id survives a renamed or moved STP, the line makes it
-resolvable by a human reading one test.
+The `[TS-{ID}-{NNN}]` tag (Go: `[test_id:TS-{ID}-{NNN}]`) remains the stable
+identity: the id survives a renamed or moved STP, the line makes it resolvable
+by a human reading one test.
 
 ---
 
@@ -731,7 +833,7 @@ resolvable by a human reading one test.
 | `test_steps.test_execution[*].action` | Steps | Numbered list — filter "Verify/Confirm" actions to Expected |
 | `test_objective.acceptance_criteria[0]` | Expected | Natural language |
 | `assertions[*].description` | Expected (fallback) | Natural language |
-| Title contains "fail"/"error"/"negative" | [NEGATIVE] marker | Prefix in description |
+| Expected outcome is a failure or refusal (`acceptance_criteria`, `assertions`) | [NEGATIVE] marker | Prefix in description |
 
 ### Assertion Wording Patterns (for Expected section)
 
@@ -754,12 +856,14 @@ Stub generation succeeds when:
 - Every STD scenario has a corresponding stub function in at least one language
 - Every stub has PSE documentation (Preconditions/Steps/Expected)
 - Every stub carries its own `STP:` line (not just the file header)
-- Each test verifies **ONE thing** with ONE Expected
+- Each test verifies **ONE thing** with ONE Expected (a migrated Polarion case
+  keeps all its source's expected results in one stub)
 - Related tests are grouped (classes in Python, top-level funcs in Go)
 - Stubs are excluded from execution (PendingIt/t.Skip/__test__=False)
 - Negative tests are marked with `[NEGATIVE]`
 - Valid syntax in all generated files
 - Files saved to `outputs/{JIRA_ID}/std/{language}-tests/`
+- With `polarion_lint: true`, every Python `def test_*` line ends with `# noqa: PID001`
 
 ---
 

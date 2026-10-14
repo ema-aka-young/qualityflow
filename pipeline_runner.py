@@ -1,5 +1,6 @@
 """Dashboard pipeline executor — a subprocess bridge to Claude Code, Cursor,
-or Codex, selected per request via `runtime` ("claude" | "cursor" | "codex").
+or Codex, selected per request via `runtime` ("claude" | "cursor" | "codex";
+absent means QF_RUNNER_DEFAULT_RUNTIME, default "codex").
 
 The dashboard's "Run STP/STD/tests" buttons call run_phase(); it shells out to
 `claude -p "/<command> <JIRA_ID>"` (or `agent -p "/<command> <JIRA_ID>"` for
@@ -19,6 +20,7 @@ See SESSION-pipeline-runner-HANDOFF.md for the full contract and host prereqs.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -330,6 +332,99 @@ def live_usage(jira_id, phase, stream_text):
     return {"cost_usd": None if cost is None else round(cost, 4), "tokens": tokens}
 
 
+# Phases whose instructions trace code with LSP (regression-analyzer in the
+# STP, lsp-tracer/feature-finder in codegen).
+_LSP_PHASES = {"stp", "codegen"}
+# First marker found wins. A repo with both (a Go operator with a Python test
+# folder) gets the first; ponytail: one server per repo, add a second entry
+# per language if mixed repos need both.
+_LSP_SERVERS = (("go.mod", "go", ["gopls"]),
+                ("Cargo.toml", "rust", ["rust-analyzer"]),
+                ("pom.xml", "java", ["jdtls", "-data", "{data}"]),
+                ("build.gradle", "java", ["jdtls", "-data", "{data}"]),
+                ("build.gradle.kts", "java", ["jdtls", "-data", "{data}"]),
+                ("pyproject.toml", "python", ["pyright-langserver", "--stdio"]),
+                ("setup.py", "python", ["pyright-langserver", "--stdio"]),
+                ("requirements.txt", "python", ["pyright-langserver", "--stdio"]),
+                ("tsconfig.json", "typescript", ["typescript-language-server", "--stdio"]),
+                ("package.json", "javascript", ["typescript-language-server", "--stdio"]),
+                # clangd indexes only what a compile database lists; a repo
+                # without one (just CMakeLists.txt) answers nothing.
+                ("compile_commands.json", "c", ["clangd"]))
+
+
+def _lsp_bridge_servers():
+    """{name: mcp-language-server argv} — one language server per checkout:
+    each *_REPO_PATH the run's environment points at a directory with a
+    language marker from _LSP_SERVERS. The bridge roots the server at the repo,
+    so cross-file references work; Claude Code's own LSP tool is rooted at the
+    run's cwd (/app) and returned same-file references only (verified in the
+    image for Python, Rust and Java). Empty when the bridge is not installed."""
+    if not shutil.which("mcp-language-server"):
+        return {}
+    servers = {}
+    for var, path in sorted(os.environ.items()):
+        if not var.endswith("_REPO_PATH") or not path or not Path(path).is_dir():
+            continue
+        for marker, lang, server in _LSP_SERVERS:
+            if (Path(path) / marker).exists() and shutil.which(server[0]):
+                name = "lsp_" + re.sub(r"[^a-z0-9]+", "_", var[:-len("_REPO_PATH")].lower()).strip("_")
+                # jdtls keeps its index in a -data dir; one per repo, outside it.
+                extra = [a.replace("{data}", str(Path(tempfile.gettempdir(), "qf-jdtls", name)))
+                         for a in server[1:]]
+                servers[name] = ["--workspace", path, "--lsp", server[0]] + (["--"] + extra if extra else [])
+                break
+    return servers
+
+
+# The bridge also offers edit_file and rename_symbol; runs only read.
+_LSP_BRIDGE_TOOLS = ("definition", "references", "hover", "diagnostics")
+
+
+# Seconds one bridge call may take. Measured on a large Go repo: a cold gopls
+# definition 8s, references 1s; the patched bridge exits when its server dies,
+# so this only bounds a server that is alive but stuck.
+_LSP_TOOL_TIMEOUT = 120
+
+
+def _bridge_env(cmd):
+    """The patched bridge (deploy/mcp-language-server.patch) opens workspace
+    files only when asked: typescript-language-server needs them open, and for
+    pyright and gopls opening them all is what hung the calls."""
+    return {"MCP_LSP_PRELOAD": "1"} if "typescript-language-server" in cmd else {}
+
+
+def _codex_lsp_args():
+    """Codex has no LSP tool: the bridge servers, as `-c` overrides, so the
+    project's .codex/config.toml stays static."""
+    args = []
+    for name, cmd in _lsp_bridge_servers().items():
+        args += ["-c", f'mcp_servers.{name}.command="mcp-language-server"',
+                 "-c", f"mcp_servers.{name}.args={json.dumps(cmd)}",
+                 "-c", f"mcp_servers.{name}.enabled_tools={json.dumps(list(_LSP_BRIDGE_TOOLS))}",
+                 "-c", f"mcp_servers.{name}.startup_timeout_sec=120",
+                 "-c", f"mcp_servers.{name}.tool_timeout_sec={_LSP_TOOL_TIMEOUT}"]
+        for k, v in _bridge_env(cmd).items():
+            args += ["-c", f'mcp_servers.{name}.env.{k}="{v}"']
+    return args
+
+
+def _claude_lsp_args(tmpdir):
+    """Claude runs keep the LSP plugins (symbols, hover, call hierarchy) and
+    also get the bridge servers for cross-file references: an extra
+    --mcp-config (added to .mcp.json, not replacing it), write tools denied."""
+    servers = _lsp_bridge_servers()
+    if not servers:
+        return []
+    cfg = Path(tmpdir, "lsp-mcp.json")
+    cfg.write_text(json.dumps({"mcpServers": {
+        n: {"command": "mcp-language-server", "args": cmd, "env": _bridge_env(cmd)}
+        for n, cmd in servers.items()}}))
+    # `=` form: both options take a variable number of values.
+    return [f"--mcp-config={cfg}", "--disallowedTools=" + ",".join(
+        f"mcp__{n}__{t}" for n in servers for t in ("edit_file", "rename_symbol"))]
+
+
 def _codex_prompt(command, jira_id, flags=""):
     """Adapt a QualityFlow slash-command workflow for Codex exec.
 
@@ -348,20 +443,37 @@ def _codex_prompt(command, jira_id, flags=""):
         f"outputs/{jira_id}/ tree, run the phase's checks, and leave the deliverable "
         "on disk. When the instructions mention Claude Code Skill or Task tools, "
         "replace those calls by directly reading and following the referenced "
-        "SKILL.md/agent files. Do not rewrite source code or invent a parallel "
+        "SKILL.md/agent files. When they say to use the LSP tool, use the "
+        "`lsp_*` MCP servers' definition/references/hover tools instead (one per "
+        "checked-out repo, named after its *_REPO_PATH variable); when there is "
+        "none, follow the instructions' no-LSP fallback and say so. "
+        "Never print environment variable values: check a credential is set "
+        "with `test -n`, not `env` or `echo` (the run's output is stored). "
+        "Do not rewrite source code or invent a parallel "
         "artifact layout. Finish with a concise summary of what was written and "
         "the workflow verdict."
     )
 
 
-def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False,
+_RUNTIMES = ("claude", "cursor", "codex")
+
+
+def default_runtime():
+    """The runtime a run gets when none (or an unknown one) is given:
+    QF_RUNNER_DEFAULT_RUNTIME if it names a runtime, else "codex"."""
+    r = os.environ.get("QF_RUNNER_DEFAULT_RUNTIME", "").strip()
+    return r if r in _RUNTIMES else "codex"
+
+
+def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
               rereview=False):
     """Run one pipeline phase via Claude Code, Cursor, or Codex.
     Returns {"output", "verdict", "progress", "usage", "model"}; raises on
     failure (ui.py shows str(e)).
 
-    runtime: "claude" (default), "cursor", or "codex" — absent/empty/unknown values
-    fall back to "claude", never an error (frozen decision 7).
+    runtime: "claude", "cursor", or "codex" — absent/empty/unknown values fall
+    back to default_runtime() ("codex" unless QF_RUNNER_DEFAULT_RUNTIME says
+    otherwise), never an error (frozen decision 7).
     creds: optional {"jira_username", "jira_token", "github_token",
     "cursor_api_key", "codex_api_key", "gcp_adc"} — the identity this one run's MCP calls
     should use (see _env_for), plus, for the claude runtime, that person's own
@@ -371,8 +483,8 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
     own identity and require the member's own Jira/GitHub (ui._members_isolated).
     rereview: a *_refine run on a document edited since its last review — the
     command re-reviews it first instead of fixing against pre-edit findings."""
-    if runtime not in ("claude", "cursor", "codex"):
-        runtime = "claude"
+    if runtime not in _RUNTIMES:
+        runtime = default_runtime()
     if os.environ.get("QF_RUNNER", "").lower() != "cli":
         raise RuntimeError(
             "Dashboard runner is disabled. Set QF_RUNNER=cli and ensure the "
@@ -430,8 +542,10 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
         #   Upgrade path: drop this if the runner ever leaves the container.
         argv = ["codex", "exec", "--json", "--ephemeral",
                 "--sandbox", "danger-full-access",
-                "--skip-git-repo-check", "--model", chosen_model,
-                _codex_prompt(cmd, jira_id, prompt[len(f"/{cmd} {jira_id}"):])]
+                "--skip-git-repo-check", "--model", chosen_model]
+        if phase in _LSP_PHASES:
+            argv += _codex_lsp_args()
+        argv.append(_codex_prompt(cmd, jira_id, prompt[len(f"/{cmd} {jira_id}"):]))
     else:
         # stream-json emits per-step events for the progress list; --verbose is
         # required with it. Headless writes files + calls MCP tools and can't prompt,
@@ -502,6 +616,14 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
                 # from an empty config. Gone with tmpdir when the run ends.
                 env["CLAUDE_CONFIG_DIR"] = str(Path(tmpdir, "claude"))
                 Path(env["CLAUDE_CONFIG_DIR"]).mkdir(mode=0o700)
+                # The image's prebuilt config: the LSP plugins installed and
+                # enabled at user scope. Plugins enabled only in the repo's
+                # .claude/settings.json are skipped as repo-authored, and a
+                # plugin seed registers after the LSP manager has started with
+                # 0 servers — both verified in the image's --debug-file log.
+                template = os.environ.get("QF_CLAUDE_CONFIG_TEMPLATE", "")
+                if template and Path(template).is_dir():
+                    shutil.copytree(template, env["CLAUDE_CONFIG_DIR"], dirs_exist_ok=True)
             if runtime == "codex":
                 # Keep Codex's auth/cache state per run. The API key itself is
                 # supplied only through this child environment and never in
@@ -519,6 +641,10 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
                 if not (creds.get("codex_api_key") or "").strip():
                     raise ValueError("OpenAI API key required for a Codex run — "
                                      "paste it in Settings")
+        if runtime == "claude" and phase in _LSP_PHASES:
+            argv += _claude_lsp_args(tmpdir)
+            # Cap every MCP call so a stuck one fails instead of stalling the run.
+            env.setdefault("MCP_TOOL_TIMEOUT", str(_LSP_TOOL_TIMEOUT * 1000))
         if runtime == "claude" and adc:
             adc_path = Path(tmpdir, "adc.json")
             adc_path.write_text(_validated_adc(adc))
@@ -578,6 +704,9 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
         finally:
             _LIVE_CODEX_SESSIONS.pop(f"{jira_id}/{phase}", None)
             _LIVE_CODEX_SESSIONS.pop(f"{jira_id}/{phase}#model", None)
+            # The stream holds every command's output and stays on the PVC; a
+            # run on cnv2 printed `env` lines for token variables (2026-10-08).
+            _redact_file(stream_file)
     if proc.returncode != 0:
         # Surface the real error: the stream's final result text (which carries
         # pipeline errors) plus the stderr tail, not just whichever came last.
@@ -610,8 +739,56 @@ def run_phase(model, jira_id, phase, creds=None, runtime="claude", isolate=False
             "output_tokens": usage.get("output_tokens")})
     # The success text is persisted too (pipeline_state.yaml "output").
     final_text = _redact_secrets(final_text)
-    return {"output": final_text, "verdict": _extract_verdict(final_text),
-            "progress": progress, "usage": usage, "model": model}
+    result = {"output": final_text, "verdict": _extract_verdict(final_text),
+              "progress": progress, "usage": usage, "model": model}
+    if phase in _LSP_PHASES:
+        result["lsp"] = _lsp_calls(proc.stdout)
+    return result
+
+
+def _redact_file(path):
+    """Best-effort: rewrite `path` with _redact_secrets applied."""
+    try:
+        text = Path(path).read_text(errors="replace")
+        clean = _redact_secrets(text)
+        if clean != text:
+            Path(path).write_text(clean)
+    except OSError:
+        pass
+
+
+def _lsp_calls(stdout):
+    """{"ok": n, "failed": n} language-server calls in a run's stream: Codex's
+    mcp_tool_call items on the lsp_* bridge servers, Claude's LSP tool and
+    mcp__lsp_* calls (a tool_result with is_error counts as failed). The
+    dashboard's "No LSP regression analysis" caveat is set from this, not from
+    words in the summary."""
+    ok = failed = 0
+    claude_ids = set()
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        item = ev.get("item") or {}
+        if (ev.get("type") == "item.completed" and item.get("type") == "mcp_tool_call"
+                and str(item.get("server", "")).startswith("lsp_")):
+            if item.get("status") == "completed" and not item.get("error"):
+                ok += 1
+            else:
+                failed += 1
+        for block in (ev.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and (
+                    block.get("name") == "LSP" or str(block.get("name", "")).startswith("mcp__lsp_")):
+                claude_ids.add(block.get("id"))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in claude_ids:
+                if block.get("is_error"):
+                    failed += 1
+                else:
+                    ok += 1
+    return {"ok": ok, "failed": failed}
 
 
 def _parse_codex_stream(stdout):
@@ -742,6 +919,8 @@ def _usage_extra(result):
         extra["usage"] = result["usage"]
     if result.get("model"):
         extra["model"] = result["model"]
+    if result.get("lsp") is not None:
+        extra["lsp"] = result["lsp"]
     return extra
 
 
@@ -844,7 +1023,8 @@ def main(argv):
     import argparse
     ap = argparse.ArgumentParser(prog="pipeline_runner.py", description=main.__doc__)
     sub = ap.add_subparsers(dest="op", required=True)
-    p = sub.add_parser("run", help="run one phase via `claude -p` with usage capture")
+    p = sub.add_parser("run", help="run one phase via the default runtime's CLI "
+                       "(QF_RUNNER_DEFAULT_RUNTIME, default codex) with usage capture")
     p.add_argument("jira_id")
     p.add_argument("phase", choices=sorted(_CMD))
     p.add_argument("--model", default="", help="model override (default: inherit)")
@@ -880,17 +1060,23 @@ def main(argv):
 
 # A chained command's summary can MENTION a verdict it didn't reach ("refine
 # runs only on NEEDS_REVISION") — a bare substring scan took the mention as the
-# verdict (found on CNV-50425's first chained run). Require the verdict label
+# verdict (found on a ticket's first chained run). Require the verdict label
 # and take the LAST labeled occurrence: after a refine loop that is the final
 # verdict, not the initial one.
 _VERDICT_RE = re.compile(
     r"[Vv]erdict[^A-Z]{0,40}(NEEDS_REVISION|APPROVED_WITH_FINDINGS|APPROVED)")
+# One label can carry the whole loop: "Verdict: **NEEDS_REVISION → APPROVED**".
+_VERDICT_NEXT_RE = re.compile(
+    r"\**\s*(?:→|->|=>)\s*\**\s*(NEEDS_REVISION|APPROVED_WITH_FINDINGS|APPROVED)")
 
 
 def _extract_verdict(text):
-    labeled = _VERDICT_RE.findall(text or "")
+    labeled = list(_VERDICT_RE.finditer(text or ""))
     if labeled:
-        return labeled[-1]
+        verdict, pos = labeled[-1].group(1), labeled[-1].end()
+        while m := _VERDICT_NEXT_RE.match(text, pos):
+            verdict, pos = m.group(1), m.end()
+        return verdict
     # Fallback for final texts with no "verdict" label at all; longest-first so
     # APPROVED_WITH_FINDINGS is never misread as its APPROVED substring.
     for v in ("APPROVED_WITH_FINDINGS", "NEEDS_REVISION", "APPROVED"):
@@ -920,7 +1106,7 @@ if __name__ == "__main__":  # self-check: parser on a fixture, no CLI/network
     assert model == "claude-sonnet-5", model
     assert _extract_verdict(out) == "APPROVED_WITH_FINDINGS", out
     assert _extract_verdict("all clear") is None
-    # regression (CNV-50425 first chained run): a summary that MENTIONS
+    # regression (a ticket's first chained run): a summary that MENTIONS
     # NEEDS_REVISION while its labeled verdict is APPROVED_WITH_FINDINGS
     _chained = ("Review complete — verdict **APPROVED_WITH_FINDINGS** (0 critical). "
                 "Per the workflow, `/refine-stp` runs only on `NEEDS_REVISION`, so no "
@@ -929,6 +1115,8 @@ if __name__ == "__main__":  # self-check: parser on a fixture, no CLI/network
     # after a refine loop the LAST labeled verdict is the final one
     _refined = "Initial verdict: NEEDS_REVISION ... Final verdict: APPROVED"
     assert _extract_verdict(_refined) == "APPROVED", _refined
+    _arrow = "- Verdict: **NEEDS_REVISION → APPROVED_WITH_FINDINGS** after 1 refinement iteration"
+    assert _extract_verdict(_arrow) == "APPROVED_WITH_FINDINGS", _arrow
     assert usage["cost_usd"] == 0.42 and usage["input_tokens"] == 100, usage
     assert usage["output_tokens"] == 20 and usage["duration_ms"] == 1234, usage
     assert usage["cache_creation_input_tokens"] == 5 and usage["cache_read_input_tokens"] == 7, usage

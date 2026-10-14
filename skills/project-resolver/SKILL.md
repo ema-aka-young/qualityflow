@@ -91,6 +91,25 @@ parallel (multiple `mcp__github__get_file_contents` calls in one message).
 Attach the result as `project_context.repo_rules` (the script emits `repo_rules: {}`
 as the placeholder).
 
+**CODEOWNERS of the design-docs repo.** In the same step, when `repositories.yaml`
+has a `design_docs_repo`, fetch `.github/CODEOWNERS`, then `CODEOWNERS`, from it
+(`mcp__github__get_file_contents`, or `gh api repos/{org}/{name}/contents/{path}`).
+The people who own the STP directory review every STP PR, so stp-generator lists
+them as stakeholders. Parse each non-comment line (`<pattern> @owner ...`) into
+`project_context.codeowners`; neither file → `codeowners: []`, no warning needed:
+
+```yaml
+codeowners:
+  - pattern: "/stps/"            # as written in the file
+    owners: ["@jsmith", "@my-org/qe-team"]
+```
+
+**Past signers.** `past_signers.py --repo {design_docs_repo.full_name}` lists
+who signed the repo's merged STPs (`*Sign-off:*`, `*PM/Lead Agreement:*`), with
+counts, folders and the date of the newest STP each signed. stp-generator runs
+it for the stakeholders sidecar, so an STP's author knows whom to ask for its
+sign-offs; it is not part of `project_context`.
+
 ### Auto-Discovery Fallback (script exit code 3)
 
 **Trigger:** Routing lookup failed AND `SOURCE_REPO_PATH` points to a local
@@ -204,6 +223,7 @@ project_context:
     platform_name: "{from project.yaml, default 'N/A'}"
     current_version: "{from project.yaml, default 'N/A'}"
   repo_rules: {}                  # populated by Step 2 when repo_files_fetch is true
+  codeowners: []                  # design_docs_repo CODEOWNERS, populated by Step 2
 ```
 
 When `issue_source == "github"`, the script also includes:
@@ -258,7 +278,7 @@ Each agent reads additional config files on-demand from `config_dir`:
 | github-issue-collector | `github.yaml` (optional), `components.yaml` |
 | github-pr-fetcher | `repositories.yaml` (optional) |
 | regression-analyzer | `repositories.yaml`, `components.yaml` |
-| stp-generator | `project.yaml`, `environment.yaml`, `tier1.yaml`, `tier2.yaml` |
+| stp-generator | `project.yaml` (incl. `stakeholders`), `environment.yaml`, `tier1.yaml`, `tier2.yaml` |
 | document-formatter | `pii_exceptions.yaml` |
 | ticket-context-analyzer | `repositories.yaml` |
 
@@ -268,7 +288,8 @@ The `unit_tests` toggle is informational only. It signals whether unit tests are
 in scope for a project configuration, but no QualityFlow command or skill gates
 on it. The toggles that ARE actively gated by commands, agents, or skills:
 `tier1_tests`, `tier2_tests`, `stp_generation`, `std_generation`, `stp_review`,
-`std_review`, `lsp_analysis`, `pii_sanitization`, `repo_files_fetch`.
+`std_review`, `lsp_analysis`, `pii_sanitization`, `repo_files_fetch`, `polarion`,
+`polarion_lint`.
 
 The `test_strategy` toggle controls how test classification and code generation work:
 

@@ -41,6 +41,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import fcntl
+import fnmatch
 import hashlib
 import hmac
 import ipaddress
@@ -211,7 +212,7 @@ _TASK_ITEM = re.compile(r"<li>(\s*<p>)?\[([ xX])\]\s")
 def _md_to_html(raw: str) -> str:
     """Markdown -> sanitized HTML, same allowlist/trust-boundary as get_artifact.
 
-    tab_length=2: STPs nest lists with 2-space indents (the CNV template and
+    tab_length=2: STPs nest lists with 2-space indents (team templates and
     GitHub both do). Python-Markdown's default of 4 flattened every nested
     bullet into its parent list, so the dashboard showed a Known Limitation, its
     detail and its sign-off as three unrelated siblings.
@@ -394,6 +395,16 @@ if not _RUNNER_CODEX_MODELS:
 if _RUNNER_CODEX_MODEL_DEFAULT not in _RUNNER_CODEX_MODELS:
     _RUNNER_CODEX_MODELS.insert(0, _RUNNER_CODEX_MODEL_DEFAULT)
 
+# Runtime a run gets when the browser sends none (a person who never opened
+# Settings) or an unknown one. One setting for the dashboard and the runner
+# (pipeline_runner.default_runtime reads the same variable); everyone can still
+# pick another runtime in Settings.
+_RUNTIMES = ("claude", "cursor", "codex")
+_RUNNER_DEFAULT_RUNTIME = os.environ.get("QF_RUNNER_DEFAULT_RUNTIME", "").strip()
+if _RUNNER_DEFAULT_RUNTIME not in _RUNTIMES:
+    _RUNNER_DEFAULT_RUNTIME = "codex"
+
+
 def _claude_available() -> bool:
     return bool(_VERTEX_PROJECT or _ANTHROPIC_API_KEY)
 
@@ -461,6 +472,7 @@ async def _lifespan(_app: FastAPI):
         logger.info("Startup reconciliation: marked %d coverage task(s) failed (was in-flight at restart)",
                     _stale_tasks)
     _start_git_sync_loop()
+    _start_team_repos_loop()
     _start_review_cycle_loop()
     # One structured line an operator can read straight off `oc logs` to confirm
     # the effective config. Values only — no tokens, no credentialed URLs.
@@ -1281,6 +1293,99 @@ def _git_sync() -> dict:
         _git_sync_lock.release()
 
 
+# Team repos (tests repo, product code, design docs) the pipeline analyzes. A
+# laptop has its own clones and exports <NAME>_REPO_PATH; a dashboard pod has
+# neither, so without this every dashboard run skipped LSP and the existing-test
+# search. The image sets QF_REPOS_DIR; unset (a laptop) leaves this off.
+_OPERATOR_ENV = frozenset(os.environ)  # variables the operator set: never overridden
+_TEAM_REPO_TIMEOUT = int(os.environ.get("QF_REPOS_TIMEOUT", "900"))  # a large repo's first clone
+_team_repos_lock = threading.Lock()
+_team_repos_status: dict = {"status": "off"}
+
+
+def _configured_team_repos() -> list[dict]:
+    """Every repositories.yaml entry, across projects, that names an https url
+    and a local_path_env — the variable the pipeline reads for its checkout."""
+    out = []
+    for f in sorted(CONFIG.glob("projects/*/repositories.yaml")):
+        if f.parent.name == "example":
+            continue
+        try:
+            data = _read_yaml(f) or {}
+        except Exception:
+            continue
+        entries = [data.get(k) for k in ("primary_repo", "tier2_repo", "design_docs_repo")]
+        entries += list(data.get("additional_repos") or [])
+        out += [e for e in entries if isinstance(e, dict)
+                and str(e.get("url", "")).startswith("https://")
+                and re.fullmatch(r"[A-Z][A-Z0-9_]*", str(e.get("local_path_env", "")))]
+    return out
+
+
+def _sync_team_repos() -> dict:
+    """Shallow-clone each configured team repo under QF_REPOS_DIR (later passes
+    fast-forward it) and point its local_path_env there, so dashboard runs —
+    whose env is copied from this process — find the checkout like a laptop run.
+    ponytail: one sequential pass; a slow first clone delays the others."""
+    global _team_repos_status
+    root = os.environ.get("QF_REPOS_DIR", "")
+    if not root:
+        return {"status": "off"}
+    if not _team_repos_lock.acquire(blocking=False):
+        return {"status": "busy"}
+    try:
+        import git  # type: ignore[import-untyped]
+
+        repos: dict[str, str] = {}
+        for e in _configured_team_repos():
+            env_var = e["local_path_env"]
+            if env_var in _OPERATOR_ENV:
+                repos[e["url"]] = "operator-set"
+                continue
+            host, path = _repo_identity(e["url"])
+            dest = Path(root, re.sub(r"[^A-Za-z0-9_.-]", "_", path.strip("/").replace("/", "__")))
+            git_env = {**_GIT_SLOW_ENV, **_git_auth_env(e["url"])}
+            try:
+                if (dest / ".git").exists():
+                    repo = git.Repo(dest)
+                    # A run may be using it (codegen collects generated tests in
+                    # the tests repo): never move a checkout with local changes.
+                    if not repo.is_dirty(untracked_files=True):
+                        repo.git.update_environment(**git_env)
+                        repo.remotes.origin.fetch(depth=1, kill_after_timeout=_TEAM_REPO_TIMEOUT)
+                        repo.git.reset("--hard", "FETCH_HEAD")
+                else:
+                    shutil.rmtree(dest, ignore_errors=True)  # a clone killed mid-way
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    kw = {"branch": e["default_branch"]} if e.get("default_branch") else {}
+                    git.Repo.clone_from(e["url"], dest, depth=1, single_branch=True, env=git_env,
+                                        kill_after_timeout=_TEAM_REPO_TIMEOUT, **kw)
+                os.environ[env_var] = str(dest)
+                repos[e["url"]] = "ok"
+            except Exception as exc:
+                repos[e["url"]] = "error: " + _redact_url(str(exc))[:300]
+                logger.warning("Team repo %s: %s", e["url"], repos[e["url"]])
+        _team_repos_status = {"status": "ok", "synced_at": datetime.now(timezone.utc)
+                              .isoformat(timespec="seconds"), "repos": repos}
+        return _team_repos_status
+    finally:
+        _team_repos_lock.release()
+
+
+def _start_team_repos_loop() -> None:
+    if not os.environ.get("QF_REPOS_DIR"):
+        return
+    interval = int(os.environ.get("GIT_SYNC_INTERVAL", "300"))
+
+    def loop():
+        while not _shutdown_event.is_set():
+            logger.info("Team repos: %s", _sync_team_repos().get("status"))
+            if _shutdown_event.wait(interval):
+                break
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def _start_git_sync_loop() -> None:
     """Background thread that periodically syncs from Git."""
     interval = int(os.environ.get("GIT_SYNC_INTERVAL", "300"))
@@ -1344,6 +1449,7 @@ def dashboard_status(request: Request):
         "git_repo": _redact_url(os.environ.get("GIT_REPO_URL", "")),
         "git_branch": os.environ.get("GIT_BRANCH", "main"),
         "last_sync": _last_sync,
+        "team_repos": _team_repos_status,
         "root": str(ROOT),
         "manager_mode": bool(_get_peers()),
         "sso_enabled": _OIDC_ENABLED,
@@ -1549,6 +1655,21 @@ def metrics():
 # Helpers
 # ---------------------------------------------------------------------------
 
+class _TextTimestampLoader(yaml.SafeLoader):
+    """safe_load, except an unquoted timestamp stays the string it was written as.
+
+    State files are also written by agents, by hand: an import run wrote
+    `timestamp: 2026-10-08T05:45:33Z` to approvals.yaml, safe_load made it a
+    datetime, and sorting it against the dashboard's own ISO strings 500'd
+    /api/activity for every ticket (cnv2, 2026-10-08). Every reader here
+    expects strings."""
+
+
+_TextTimestampLoader.yaml_implicit_resolvers = {
+    first: [r for r in resolvers if r[0] != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()}
+
+
 def _read_yaml(path: Path) -> dict:
     """Read a YAML file, return empty dict on failure.
 
@@ -1556,7 +1677,7 @@ def _read_yaml(path: Path) -> dict:
     failure: every caller here indexes the result like a mapping, so returning
     the list only moves the crash one line down."""
     try:
-        data = yaml.safe_load(path.read_text())
+        data = yaml.load(path.read_text(), Loader=_TextTimestampLoader)
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
@@ -1744,6 +1865,14 @@ def _record_phase_result(phases: dict, phase: str, phase_data: dict) -> None:
         for k in ("started_ts", "actor", "actor_name"):
             if k in prev and k not in phase_data:
                 phase_data[k] = prev[k]
+        # The terminal write also keeps what the CLI wrote in place during this
+        # run (`state.py complete-phase --extra`: codegen's `verification`,
+        # `test_count`, std's checksums...). The placeholder write does not: a
+        # pre-dashboard in_progress entry may hold an older run's fields.
+        if phase_data.get("status") in _TERMINAL_PHASE_STATUSES:
+            for k, v in prev.items():
+                if k not in phase_data and k not in ("history", "error"):
+                    phase_data[k] = v
     phases[phase] = phase_data
 
 
@@ -1758,6 +1887,11 @@ _ARTIFACT_KINDS: dict[str, tuple[str, str]] = {
     "std_refinement_log": ("reviews", "{id}_std_refinement_log.md"),
     "stp_feedback": ("reviews", "{id}_stp_feedback.md"),
     "std_feedback": ("reviews", "{id}_std_feedback.md"),
+    # The team's own STP, pulled in by stp-builder Step 0.5 instead of generated.
+    "stp_source": ("stp", "{id}_stp_source.yaml"),
+    # regression-analyzer's YAML: the LSP evidence (callers, file:line) that
+    # the STP may not quote. Shown so a reviewer can check what was traced.
+    "regression_analysis": ("stp", "{id}_regression_analysis.yaml"),
 }
 
 
@@ -2001,6 +2135,12 @@ def get_pipeline(jira_id: str):
     # Same enrichments the list endpoint carries — the detail view renders
     # caveat/auto-approval chips and rich phase output from THIS payload.
     state["caveats"] = _detect_caveats(state)
+    source = _artifact_path(jira_id, "stp_source")
+    if source.exists():
+        try:
+            state["stp_source"] = _read_yaml(source)
+        except Exception:
+            logger.exception("Could not read %s", source)
     state["auto_approved"] = [
         g for g, e in _read_approvals(jira_id).items()
         if isinstance(e, dict) and e.get("reviewer") == "dashboard (auto)"
@@ -2146,10 +2286,10 @@ def _find_test_files(jira_id: str, lang: str) -> list[Path]:
     (outputs/go-tests/{id}/), JIRA-first (outputs/{id}/go-tests/), and nested
     under the STD dir (outputs/std/{id}/go-tests/). Check all three.
     """
-    # QF codegen writes the `qf_` prefix (qf_{feature}{ext}) — see CLAUDE.md — but
-    # the Python generator's outputs-fallback also emits pytest-native test_*.py
-    # (e.g. CNV-95235). Both are generated tests here; exclude *_stubs* so STD
-    # stub files (test_*_stubs.py) never count as real tests.
+    # QF codegen names tests qf_{feature}_test.go and test_qf_{feature}.py (see
+    # CLAUDE.md). qf_*.py still matches the Python files written before that
+    # rule, and test_*.py also plain test_{feature}.py files.
+    # Exclude *_stubs* so STD stub files (test_*_stubs.py) never count as tests.
     patterns = ("qf_*.go",) if lang == "go" else ("qf_*.py", "test_*.py")
     dirs = _test_dirs(jira_id, lang)
     files: list[Path] = []
@@ -2235,7 +2375,7 @@ def _refresh_pr_state(jira_id: str, pr_info: dict) -> dict:
 # Dashboard gate phases ("stp"/"std") map to the CLI state machine's approval
 # keys ("stp_review"/"std_review") — the keys /std-builder and /generate-tests
 # actually read. Writing or reading any other key makes an approval invisible
-# to the pipeline (found on CNV-50425: a dashboard approval landed under "stp"
+# to the pipeline (found on a pilot ticket: a dashboard approval landed under "stp"
 # and the CLI gate stayed blocked).
 _GATE_APPROVAL_KEY = {"stp": "stp_review", "std": "std_review"}
 
@@ -2388,6 +2528,12 @@ def _summarize_phases(state: dict, _jira_id: str) -> dict:
         status = phase.get("status", "pending")
         if phase_name == "codegen" and status == "pending" and legacy_codegen_done:
             status = "completed"
+        # A review/refine step its document finished without (turned off, or a
+        # run older than the step) will never run: skipped, not pending.
+        parent = phase_name.rsplit("_", 1)[0]
+        if (phase_name not in phases and parent != phase_name
+                and (phases.get(parent) or {}).get("status") in ("completed", "awaiting_approval")):
+            status = "skipped"
         entry = {
             "status": status,
             "verdict": phase.get("verdict"),
@@ -2436,13 +2582,24 @@ def _detect_caveats(state: dict) -> list[str]:
         phase = phases.get(name)
         if not isinstance(phase, dict):
             continue
+        lsp = phase.get("lsp")
+        if isinstance(lsp, dict):
+            # Counted from the run's own stream (pipeline_runner._lsp_calls).
+            # The text check below fired on "refinement skipped" next to an
+            # unrelated "LSP" (cnv2, 2026-10-08).
+            ok, failed = lsp.get("ok") or 0, lsp.get("failed") or 0
+            if not ok:
+                _add("No LSP regression analysis")
+            elif failed:
+                _add(f"{failed} of {ok + failed} LSP calls failed")
         text = (phase.get("output") or "")
         if not text:
             continue
         low = text.lower()
         if "mcp auth failed" in low:
             _add("GitHub data incomplete")
-        if "lsp" in low and any(w in low for w in ("skipped", "not set", "unavailable")):
+        if (not isinstance(lsp, dict) and "lsp" in low
+                and any(w in low for w in ("skipped", "not set", "unavailable"))):
             _add("No LSP regression analysis")
         if "source_repo_path" in low and any(w in low for w in ("not set", "unset")):
             _add("No source checkout")
@@ -2556,12 +2713,6 @@ def activity_feed(limit: int = 30):
 
 _TRENDS_DIR = OUTPUTS / "_trends"
 
-# Upper bound for a phase duration *inferred* from file mtimes (DATA-01-F15).
-# 30 days: longer than any real phase, short enough that a shifted mtime is
-# rejected instead of averaged into the manager dashboard.
-_INFERRED_DURATION_CEILING_HOURS = 24 * 30
-
-
 def _append_trend_snapshot(project_id: str, value: dict, pipelines: int, completed: int) -> None:
     """Append today's value snapshot to the project's trend file (one row/day).
 
@@ -2649,8 +2800,8 @@ def _ticket_test_count(jira_id: str) -> int:
     per-ticket test count without re-deriving it. Python prefers
     python-tests/summary.yaml's `test_count` (compat fallback:
     `generated_tests`, an older/wrong key some summaries still carry), else
-    counts `def test_` in the qf_* files directly. Go has no summary.yaml
-    equivalent, so its functions are always counted via regex.
+    counts `def test_` in the generated files (_find_test_files) directly. Go
+    has no summary.yaml equivalent, so its functions are always counted via regex.
     """
     count = 0
     py_dir = _pick_dir(*_test_dirs(jira_id, "python"))
@@ -2666,7 +2817,7 @@ def _ticket_test_count(jira_id: str) -> int:
         except Exception:
             pass
     if not counted and py_dir:
-        for f in py_dir.glob("qf_*.py"):
+        for f in _find_test_files(jira_id, "python"):
             try:
                 count += f.read_text(errors="ignore").count("def test_")
             except Exception:
@@ -2689,6 +2840,16 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
     # `_defaults.yaml` `time_saved` > QF_* env var > built-in default. A per-team
     # calibration heuristic, not a measured number — see _load_time_saved_coeffs.
     coeffs = _load_time_saved_coeffs(project_id)
+    # Time saved credits only work a person accepted: an STP/STD past its
+    # approval gate (completed, after the gate overlay), tests from a completed
+    # codegen. A draft waiting for review, or one rejected, saved nobody time.
+    accepted: dict[str, set[str]] = {}
+    for s in states:
+        jid = str(s.get("ticket_id") or s.get("jira_id") or "")
+        if jid:
+            gated = _gated_phases(jid, s)
+            accepted[jid] = {p for p in ("stp", "std", "codegen")
+                             if (gated.get(p) or {}).get("status") == "completed"}
 
     # --- tests_generated ---
     go_files = 0
@@ -2710,10 +2871,10 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
 
     # total_tests: prefer python-tests/summary.yaml's `test_count` (what the
     # codegen skill actually writes — `generated_tests` kept as a compat
-    # fallback for older summaries); else count `def test_` in the qf_* files
-    # themselves. Go has no summary.yaml equivalent, so its functions are
-    # always counted directly via regex.
-    # scaffolded_files: qf_ test files that are `raise NotImplementedError`
+    # fallback for older summaries); else count `def test_` in the generated
+    # test files themselves. Go has no summary.yaml equivalent, so its functions
+    # are always counted directly via regex.
+    # scaffolded_files: generated test files that are `raise NotImplementedError`
     # stubs rather than runnable tests (checked across go + python).
     total_tests = 0
     scaffolded_files = 0
@@ -2742,6 +2903,7 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
         std_path = _artifact_path(jid, "std")
         if not std_path.exists():
             continue
+        std_accepted = "std" in accepted.get(jid, ())
         try:
             std_doc = yaml.safe_load(std_path.read_text()) or {}
         except Exception:
@@ -2750,8 +2912,9 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
         if meta:
             for out_key, yaml_key in _SCENARIO_KEYS.items():
                 scenario_totals[out_key] += meta.get(yaml_key) or 0
-            std_hours_total += (meta.get("total_scenarios") or 0) * hours_per_scenario
-        else:
+            if std_accepted:
+                std_hours_total += (meta.get("total_scenarios") or 0) * hours_per_scenario
+        elif std_accepted:
             std_hours_total += hours_per_std  # no document_metadata — old flat-per-STD credit
 
     # --- review_quality (auto vs. human decisions from approvals.yaml) ---
@@ -2782,12 +2945,10 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
             reviews += 1
 
     # --- phase_durations ---
-    # Prefer the timestamps a run actually recorded (started_ts/finished_ts on
-    # the phase entry). Fall back to file mtimes for tickets produced by the CLI
-    # or before those were written — but mtimes don't survive a git sync, a
-    # container rebuild or a volume restore, which is how this metric was
-    # emitting NEGATIVE durations. Anything non-positive — or, for a fallback,
-    # above _INFERRED_DURATION_CEILING_HOURS — is dropped rather than averaged in.
+    # Only the timestamps a run recorded, in either writer's keys. The old
+    # fallback took file mtimes minus `created`: that measures how long a
+    # ticket sat waiting for review (one pilot STP read 438h), not how long the
+    # phase ran, and mtimes move on every sync, rebuild or restore.
     def _ts(value) -> float | None:
         try:
             return datetime.fromisoformat(value).timestamp() if value else None
@@ -2798,56 +2959,14 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
         entry = (state.get("phases") or {}).get(phase)
         if not isinstance(entry, dict):
             return None
-        start, end = _ts(entry.get("started_ts")), _ts(entry.get("finished_ts"))
-        return (end - start) / 3600 if start and end else None
+        started, finished = _phase_timestamps(entry)  # both writer dialects
+        start, end = _ts(started), _ts(finished)
+        return (end - start) / 3600 if start and end and end > start else None
 
-    def _inferred(hours: float) -> float | None:
-        """Keep an mtime-derived duration only inside (0, 30 days].
-
-        Non-positive was already dropped; the missing half is the upper bound.
-        A volume restore or container rebuild shifts mtimes independently of the
-        recorded `created`, which put stp_avg_hours: 5130 (7 months) on the
-        manager dashboard — the same credibility failure as the negative
-        durations, from the same fallback (DATA-01-F15). Recorded
-        started_ts/finished_ts pairs are trusted and never clamped."""
-        return hours if 0 < hours <= _INFERRED_DURATION_CEILING_HOURS else None
-
-    # Per-ticket so the totals below stay aligned. The old code zipped three
-    # independently-filtered lists, which silently paired one ticket's STP with
-    # another ticket's STD as soon as any ticket had an STP but no STD.
+    # Per-ticket so the totals below stay aligned across phases.
     per_ticket: list[dict[str, float]] = []
     for s in states:
-        jid = s.get("ticket_id") or s.get("jira_id") or ""
-        if not jid:
-            continue
-        d: dict[str, float] = {}
-        stp_path, std_path = _artifact_path(jid, "stp"), _artifact_path(jid, "std")
-        stp_mt = stp_path.stat().st_mtime if stp_path.exists() else None
-        std_mt = std_path.stat().st_mtime if std_path.exists() else None
-
-        stp = _recorded(s, "stp")
-        if stp is None and stp_mt:
-            created_ts = _ts(s.get("created"))
-            stp = _inferred((stp_mt - created_ts) / 3600) if created_ts else None
-        if stp is not None and stp > 0:
-            d["stp"] = stp
-
-        std = _recorded(s, "std")
-        if std is None and std_mt and stp_mt:
-            std = _inferred((std_mt - stp_mt) / 3600)
-        if std is not None and std > 0:
-            d["std"] = std
-
-        codegen = _recorded(s, "codegen")
-        if codegen is None and std_mt:
-            latest_test = 0.0
-            for tf in _find_test_files(jid, "go") + _find_test_files(jid, "python"):
-                latest_test = max(latest_test, tf.stat().st_mtime)
-            if latest_test > std_mt:
-                codegen = _inferred((latest_test - std_mt) / 3600)
-        if codegen is not None and codegen > 0:
-            d["codegen"] = codegen
-
+        d = {p: h for p in ("stp", "std", "codegen") if (h := _recorded(s, p)) is not None}
         if d:
             per_ticket.append(d)
 
@@ -2998,13 +3117,19 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
     # credit is now per-test (total_tests), not per-file, for the same reason.
     hours_per_stp = coeffs["hours_per_stp"]
     minutes_per_test = coeffs["minutes_per_test"]
+    # The team's own STP, pulled in from its design-docs repo, saved QF nothing.
+    stps_accepted = sum(1 for jid in jira_ids if "stp" in accepted.get(jid, ())
+                        and _phase_artifact_exists(jid, "stp")
+                        and not _artifact_path(jid, "stp_source").exists())
+    tests_accepted = sum(_ticket_test_count(jid) for jid in jira_ids
+                         if "codegen" in accepted.get(jid, ()))
     time_saved_hours = round(
-        stps * hours_per_stp + std_hours_total + total_tests * (minutes_per_test / 60), 1
+        stps_accepted * hours_per_stp + std_hours_total + tests_accepted * (minutes_per_test / 60), 1
     )
     time_saved_basis = (
-        f"{hours_per_stp:g}h/STP + {hours_per_scenario:g}h/scenario "
+        f"approved work only: {hours_per_stp:g}h/STP + {hours_per_scenario:g}h/scenario "
         f"(or {hours_per_std:g}h/STD when a doc has no scenario metadata) + "
-        f"{minutes_per_test:g}m/test (configurable, estimate)"
+        f"{minutes_per_test:g}m/test — assumed hours, not measured (configurable)"
     )
 
     # --- coverage.configured: false when the project's coverage repos are
@@ -3019,7 +3144,7 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
         "time_saved_hours": time_saved_hours,
         # index.html reads the bare number above directly (arithmetic, no
         # `.value`) — kept as-is. This flagged form is additive, for the new
-        # confidence/ROI-aware frontend (also available structured the same
+        # ROI-aware frontend (also available structured the same
         # way from /api/metrics/roi).
         "time_saved_hours_flagged": {"value": time_saved_hours, "estimated": True},
         "time_saved_basis": time_saved_basis,
@@ -3080,11 +3205,11 @@ def _compute_value_metrics(project_id: str, states: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# API: Confidence / ROI / Gaps / Quality-trend / Drift / Usage
+# API: ROI / Gaps / Quality-trend / Drift / Usage
 #
-# Six read endpoints + one write (beacon). Registered *before*
+# Five read endpoints + one write (beacon). Registered *before*
 # /api/metrics/{project_id} below — that catch-all would otherwise swallow
-# e.g. /api/metrics/confidence as project_id="confidence". All read from the
+# e.g. /api/metrics/roi as project_id="roi". All read from the
 # same per-ticket pipeline_state.yaml + traceability data everything else on
 # this page already reads; none re-parse or re-implement that. Every one
 # degrades to available:false / empty lists on missing data — never a 500.
@@ -3169,177 +3294,6 @@ def _gated_phases(jira_id: str, state: dict) -> dict:
         _get_approval_gates(state.get("project_id") or state.get("project")
                             or _infer_project(jira_id)))
     return phases
-
-
-_REVIEW_VERDICT_SCORE = {"APPROVED": 1.0, "APPROVED_WITH_FINDINGS": 0.7, "NEEDS_REVISION": 0.2}
-_CONFIDENCE_SIGNAL_KEYS = ("coverage", "link_quality", "review_health", "refinement",
-                          "verification", "effectiveness", "freshness")
-
-
-def _review_phase_score(phases: dict, base: str) -> float | None:
-    """Score one doc's review (base='stp'|'std'). Checks the dedicated
-    `{base}_review` phase first (CLI dialect — carries `findings`), falling
-    back to the `{base}` phase's own `verdict` (dashboard dialect, which
-    folds review into the generation phase). This order avoids double-counting
-    the same review when a state file happens to carry both (real data does —
-    the CLI writes the granular _review phase, the dashboard runner also
-    stamps a verdict on the combined phase when the whole command finishes)."""
-    for entry in (phases.get(f"{base}_review"), phases.get(base)):
-        if not isinstance(entry, dict):
-            continue
-        # Prefer the reviewer's own holistic 0-100 weighted_score when present:
-        # it's the QE verdict itself (from dimension_scores), whereas the
-        # findings-count heuristic below clamps to 0 for many non-critical
-        # findings — a 75/100 APPROVED_WITH_FINDINGS review shouldn't read as 0.
-        ws = entry.get("weighted_score")
-        if isinstance(ws, (int, float)) and not isinstance(ws, bool):
-            return max(0.0, min(1.0, ws / 100.0))
-        findings = entry.get("findings")
-        if isinstance(findings, dict):
-            crit = findings.get("critical") or 0
-            major = findings.get("major") or 0
-            minor = findings.get("minor") or 0
-            return max(0.0, 1 - (crit * 1.0 + major * 0.2 + minor * 0.05))
-        score = _REVIEW_VERDICT_SCORE.get(entry.get("verdict"))
-        if score is not None:
-            return score
-    return None
-
-
-def _freshness_signal(updated: str | None) -> float | None:
-    """1.0 at <=7 days old, linear decay to 0.0 at 90 days, None if unknown."""
-    if not updated:
-        return None
-    try:
-        dt = datetime.fromisoformat(updated)
-    except (TypeError, ValueError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
-    if days <= 7:
-        return 1.0
-    if days >= 90:
-        return 0.0
-    return round(1 - (days - 7) / 83, 3)
-
-
-def _confidence_signals(jira_id: str, state: dict) -> dict:
-    """The 7 confidence signals for one ticket, each {"value", "available"}."""
-    phases = state.get("phases") or {}
-    signals: dict[str, dict] = {}
-
-    try:
-        trace = pipeline_traceability(jira_id)
-    except Exception:
-        trace = {"summary": {"requirements_total": 0, "requirements_with_tests": 0},
-                 "requirements": [], "orphaned_scenarios": []}
-
-    total_reqs = trace["summary"]["requirements_total"]
-    signals["coverage"] = (
-        {"value": round(trace["summary"]["requirements_with_tests"] / total_reqs, 3), "available": True}
-        if total_reqs else {"value": None, "available": False}
-    )
-
-    # link quality: strong ("id") vs inferred STP<->STD links, deduped by
-    # std_test_id (a scenario can appear under more than one requirement).
-    links: dict[str, str] = {}
-    for req in trace["requirements"]:
-        for sc in req["scenarios"]:
-            links[sc.get("std_test_id") or f"idx{len(links)}"] = sc["link"]
-    for sc in trace["orphaned_scenarios"]:
-        links[sc.get("std_test_id") or f"idx{len(links)}"] = sc["link"]
-    if links:
-        strong = sum(1 for v in links.values() if v == "id")
-        signals["link_quality"] = {"value": round(strong / len(links), 3), "available": True}
-    else:
-        signals["link_quality"] = {"value": None, "available": False}
-
-    rh_scores = [s for s in (_review_phase_score(phases, "stp"), _review_phase_score(phases, "std"))
-                 if s is not None]
-    signals["review_health"] = (
-        {"value": round(sum(rh_scores) / len(rh_scores), 3), "available": True}
-        if rh_scores else {"value": None, "available": False}
-    )
-
-    # Any *_refine phase key that actually ran (not just pre-seeded pending by
-    # `state.py init`, which stamps every canonical phase up front).
-    refine_ran = any(
-        k.endswith("_refine") and isinstance(v, dict) and v.get("status") not in (None, "pending", "not_started")
-        for k, v in phases.items()
-    )
-    signals["refinement"] = {"value": 0.5 if refine_ran else 1.0, "available": True}
-
-    verifs = [v.get("verification") for k, v in phases.items()
-              if "codegen" in k and isinstance(v, dict) and v.get("verification")]
-    if "passed" in verifs:
-        signals["verification"] = {"value": 1.0, "available": True}
-    elif "failed" in verifs:
-        signals["verification"] = {"value": 0.0, "available": True}
-    else:
-        signals["verification"] = {"value": None, "available": False}
-
-    ci_data = _read_yaml(OUTPUTS / jira_id / "ci" / "test_runs.yaml")
-    runs = ci_data.get("runs") if isinstance(ci_data, dict) else None
-    if runs:
-        latest = runs[-1] or {}
-        total = latest.get("total") or 0
-        signals["effectiveness"] = (
-            {"value": round((latest.get("passed") or 0) / total, 3), "available": True}
-            if total else {"value": None, "available": False}
-        )
-    else:
-        signals["effectiveness"] = {"value": None, "available": False}
-
-    fresh = _freshness_signal(state.get("updated"))
-    signals["freshness"] = {"value": fresh, "available": fresh is not None}
-
-    return signals
-
-
-def _score_confidence(signals: dict) -> tuple[int | None, str, int, str | None]:
-    """Score = mean(available signals) * 100. Fewer than 4 available signals
-    -> never fake a green: band 'insufficient', score None."""
-    available = {k: v["value"] for k, v in signals.items() if v["available"]}
-    biggest_drag = min(available, key=available.get) if available else None
-    if len(available) < 4:
-        return None, "insufficient", len(available), biggest_drag
-    score = round(sum(available.values()) / len(available) * 100)
-    band = "trusted" if score >= 80 else "watch" if score >= 60 else "at_risk"
-    return score, band, len(available), biggest_drag
-
-
-@app.get("/api/metrics/confidence")
-def get_metrics_confidence(project: str = ""):
-    """Per-ticket + project rollup trust score across 7 pipeline-health signals."""
-    return _cached(f"confidence:{project}", lambda: _compute_confidence(project))
-
-
-def _compute_confidence(project: str) -> dict:
-    tickets = []
-    for jira_id, state in _project_states(project):
-        try:
-            signals = _confidence_signals(jira_id, state)
-            score, band, n, biggest_drag = _score_confidence(signals)
-        except Exception:
-            logger.exception("confidence: skipped %s", jira_id)
-            continue
-        tickets.append({
-            "jira_id": jira_id, "score": score, "band": band,
-            "signals_present": n, "signals_total": len(_CONFIDENCE_SIGNAL_KEYS),
-            "biggest_drag": biggest_drag, "signals": signals,
-        })
-    numeric = [t["score"] for t in tickets if t["score"] is not None]
-    rollup_score = round(sum(numeric) / len(numeric)) if numeric else None
-    rollup_band = ("insufficient" if rollup_score is None else
-                   "trusted" if rollup_score >= 80 else "watch" if rollup_score >= 60 else "at_risk")
-    return {
-        "project": project or "_all",
-        # derived: mean(available signals) * 100 — a documented formula over
-        # recorded pipeline state, not a raw read or a coefficient estimate.
-        "rollup": {"score": rollup_score, "band": rollup_band, "tickets": len(tickets), "basis": "derived"},
-        "tickets": tickets,
-    }
 
 
 @app.get("/api/metrics/roi")
@@ -3445,8 +3399,8 @@ def get_metrics_gaps(project: str = ""):
 
 @app.get("/api/metrics/quality-trend")
 def get_metrics_quality_trend(project: str = "", member: str = ""):
-    """Review-quality history: per-run verdicts/findings, first-time-approve
-    rate (FTAR), and a findings-by-day trend. ?member= -> _member_states."""
+    """Review-quality history: per-run verdicts/findings and a findings-by-day
+    trend. ?member= -> _member_states."""
     runs = []
     for jira_id, state in _member_states(project, member):
         try:
@@ -3457,7 +3411,7 @@ def get_metrics_quality_trend(project: str = "", member: str = ""):
             std_verdict = std_entry.get("verdict") if isinstance(std_entry, dict) else None
             verdicts = {k: v for k, v in (("stp", stp_verdict), ("std", std_verdict)) if v}
             if not verdicts:
-                continue  # nothing reviewed yet — not a "run" for FTAR purposes
+                continue  # nothing reviewed yet
             findings = {"critical": 0, "major": 0, "minor": 0}
             for entry in (stp_entry, std_entry):
                 f = entry.get("findings") if isinstance(entry, dict) else None
@@ -3469,25 +3423,14 @@ def get_metrics_quality_trend(project: str = "", member: str = ""):
                 if k.endswith("_refine") and isinstance(v, dict)
                 and v.get("status") not in (None, "pending", "not_started")
             )
-            rejected = any(
-                isinstance(e, dict) and e.get("status") == "rejected"
-                for e in _read_approvals(jira_id).values()
-            )
-            first_time_approve = (
-                all(v == "APPROVED" for v in verdicts.values())
-                and refine_loops == 0 and not rejected
-            )
             date = (state.get("updated") or state.get("created") or "")[:10]
             runs.append({
                 "jira_id": jira_id, "date": date, "verdicts": verdicts,
-                "findings": findings, "first_time_approve": first_time_approve,
+                "findings": findings,
                 "refine_loops": refine_loops,
             })
         except Exception:
             logger.exception("quality-trend: skipped %s", jira_id)
-
-    n = len(runs)
-    ftar_value = round(sum(1 for r in runs if r["first_time_approve"]) / n, 2) if n else 0.0
 
     trend_by_date: dict[str, dict] = {}
     for r in runs:
@@ -3500,7 +3443,6 @@ def get_metrics_quality_trend(project: str = "", member: str = ""):
     return {
         "project": project or "_all",
         "runs": runs,
-        "ftar": {"value": ftar_value, "n": n},
         "findings_trend": sorted(trend_by_date.values(), key=lambda b: b["date"]),
     }
 
@@ -3555,8 +3497,7 @@ def _engineering_states(project: str, member: str = "") -> list[dict]:
 
 @app.get("/api/metrics/engineering")
 def get_metrics_engineering(project: str = "", member: str = ""):
-    """Cycle time, phase durations, cost, automation rate, and first-pass
-    rates — the qf_metrics.py aggregates. Same state scan + cache TTL as the
+    """Cycle time and phase durations — the qf_metrics.py aggregates. Same state scan + cache TTL as the
     other /api/metrics endpoints; the math itself lives in qf_metrics so it's
     testable without a server. ?member= -> _member_states (ticket-level)."""
     import qf_metrics
@@ -3568,8 +3509,6 @@ def get_metrics_engineering(project: str = "", member: str = ""):
         return cached[1]
 
     states = _engineering_states(project, member)
-    approvals_by_ticket = {s["ticket_id"]: _read_approvals(s["ticket_id"]) for s in states}
-
     cycles = [c for s in states if qf_metrics.is_completed_run(s.get("phases") or {})
              and (c := qf_metrics.cycle_seconds(s.get("phases") or {}, _phase_timestamps)) is not None]
     if len(cycles) < qf_metrics.MIN_N:
@@ -3587,8 +3526,6 @@ def get_metrics_engineering(project: str = "", member: str = ""):
         "n_completed_runs": sum(1 for s in states if qf_metrics.is_completed_run(s.get("phases") or {})),
         "cycle": cycle,
         "phase_durations": phase_durations,
-        "automation": qf_metrics.automation_summary(states, approvals_by_ticket, qf_metrics.default_is_human),
-        "first_pass": qf_metrics.first_pass_summary(states, approvals_by_ticket),
     }
     _metrics_cache[cache_key] = (now, result)
     return result
@@ -3647,7 +3584,7 @@ _REVIEW_SIDE = {
     "waiting_reviewer": "reviewer",
     "waiting_author": "author",
     "waiting_ack": "acknowledgement",
-    "stale": "nobody — the PR has gone quiet",
+    "stale": "author — the PR has gone quiet",
 }
 
 
@@ -3697,9 +3634,9 @@ def _github_repos_for_project(project_id: str, sla: dict | None = None) -> list[
     """GitHub `org/repo` names to poll.
 
     `review_sla.watch_repos` when set; otherwise the project's primary_repo
-    only. additional_repos are deliberately NOT polled by default: for CNV that
-    list carries kubevirt/kubevirt — 300+ open upstream PRs, none of them the
-    team's to review, every one of them would land in Needs You.
+    only. additional_repos are deliberately NOT polled by default: they usually
+    name upstream repos with hundreds of open PRs, none of them the team's to
+    review, and every one of them would land in Needs You.
 
     GitLab entries are skipped — this feature is GitHub-only, and a GitLab URL
     against the GitHub API is a guaranteed 404 per pass.
@@ -3793,7 +3730,7 @@ def _review_nudge(rec: dict, sla: dict, now: float) -> bool:
     QF_REVIEW_NUDGES=off keeps the tile, the insights and the persisted
     history but sends nothing — the first pass on a repo with a long-lived
     queue would otherwise post one message per over-SLA PR in a single burst
-    (56 on the CNV primary repo the day this shipped). Flip it on once the
+    (56 on one team's primary repo the day this shipped). Flip it on once the
     team has agreed the thresholds and the channel."""
     import review_cycle
     if os.environ.get("QF_REVIEW_NUDGES", "on").strip().lower() in ("off", "0", "false", "no"):
@@ -4125,49 +4062,6 @@ def get_metrics_review_cycle(project: str = ""):
     return _cached(f"review-cycle:{project}", _compute)
 
 
-_REVIEW_INSIGHT_CAP = 10  # oldest over-SLA PRs listed individually; the rest roll up
-
-
-def _review_stuck_insights(project: str) -> list[dict]:
-    """One insight per over-SLA PR (oldest first, capped) in get_insights' item
-    shape, plus one roll-up line for the remainder. The first live pass found
-    64 of 77 PRs over SLA — 64 rows would have buried every other insight."""
-    try:
-        data = get_metrics_review_cycle(project)
-    except Exception:
-        logger.exception("review_stuck insights failed for %s", project)
-        return []
-    if not data.get("available"):
-        return []
-    over = [pr for pr in (data.get("prs") or []) if pr.get("over_sla")]
-    over.sort(key=lambda p: -(p.get("age_hours") or 0))
-    out = []
-    for pr in over[:_REVIEW_INSIGHT_CAP]:
-        stale = pr.get("state") == "stale"
-        side = _REVIEW_SIDE.get(pr.get("state"), pr.get("state") or "")
-        who = ", ".join(pr.get("waiting_on") or []) or "nobody assigned"
-        out.append({
-            "type": "review_stuck", "severity": "critical" if stale else "warn",
-            "title": f"{pr.get('repo')}#{pr.get('number')} waiting on {side} for "
-                     f"{pr.get('age_hours') or 0:.0f}h",
-            "detail": f"{pr.get('title') or ''} — {pr.get('reason') or ''}".strip(" —"),
-            "jira_id": None, "url": pr.get("url"),
-            "recommended_action": f"Ping {who} on the PR, or take it off the review queue.",
-        })
-    rest = len(over) - len(out)
-    if rest > 0:
-        stale_rest = sum(1 for p in over[_REVIEW_INSIGHT_CAP:] if p.get("state") == "stale")
-        out.append({
-            "type": "review_stuck", "severity": "warn",
-            "title": f"{rest} more PR{'s' if rest != 1 else ''} over review SLA",
-            "detail": f"{stale_rest} of them stale (no activity for days). "
-                      f"The Review cycle tile carries the totals; Needs You lists the oldest.",
-            "jira_id": None, "url": None,
-            "recommended_action": "Work the oldest first — they set the medians.",
-        })
-    return out
-
-
 _INSIGHT_SEVERITY_ORDER = {"critical": 0, "warn": 1, "info": 2}
 _STALE_RUN_DAYS = 5  # matches ui/index.html's _isStaleAge amber threshold
 
@@ -4268,7 +4162,6 @@ def get_insights(project: str = ""):
                     "recommended_action": "Check the task status, or re-trigger the phase.",
                 })
 
-    insights.extend(_review_stuck_insights(project))
 
     insights.sort(key=lambda i: _INSIGHT_SEVERITY_ORDER.get(i["severity"], 3))
     result = {"project": project or "_all", "insights": insights}
@@ -4316,6 +4209,13 @@ async def post_beacon(request: Request):
         return {"status": "ignored"}  # fire-and-forget: a 429 would buy the caller nothing
     _USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
     row = {"date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "view": view}
+    # Who viewed, for adoption: the SSO user, else the display name the
+    # viewer set in Settings. A claimed name only counts heads; it never
+    # attributes an action (that stays _actor_identity's job).
+    user = _session_user(request)
+    who = (user.get("email") or user.get("name")) if user else str((body or {}).get("who") or "").strip()[:64]
+    if who:
+        row["who"] = who
     try:
         if _USAGE_LOG.exists() and _USAGE_LOG.stat().st_size > _USAGE_LOG_MAX_BYTES:
             os.replace(_USAGE_LOG, _USAGE_LOG.with_name(_USAGE_LOG.name + ".1"))
@@ -4332,6 +4232,8 @@ def get_metrics_usage():
     (upsert-by-rewrite would work too; plain append is simpler and the log
     stays small — one line per page view)."""
     views: dict[str, dict] = {}
+    viewers: dict[str, dict] = {}
+    anonymous = 0
     if _USAGE_LOG.exists():
         try:
             lines = _USAGE_LOG.read_text().splitlines()
@@ -4352,7 +4254,21 @@ def get_metrics_usage():
             entry["hits"] += 1
             if row.get("date"):
                 entry["days"].add(row["date"])
-    return {"views": {v: {"hits": e["hits"], "active_days": len(e["days"])} for v, e in views.items()}}
+            who = row.get("who")
+            if not who:
+                anonymous += 1
+                continue
+            person = viewers.setdefault(who, {"hits": 0, "days": set()})
+            person["hits"] += 1
+            if row.get("date"):
+                person["days"].add(row["date"])
+    return {
+        "views": {v: {"hits": e["hits"], "active_days": len(e["days"])} for v, e in views.items()},
+        "viewers": {w: {"hits": e["hits"], "active_days": len(e["days"]),
+                        "last_seen": max(e["days"]) if e["days"] else None}
+                    for w, e in viewers.items()},
+        "anonymous_hits": anonymous,
+    }
 
 
 @app.get("/api/metrics/{project_id}")
@@ -4501,7 +4417,7 @@ def _get_peers() -> list[dict]:
 
     Source (first that exists wins):
       1. config/peers.yaml  ->  {peers: [{label, url, token?}]}  (or a bare list)
-      2. env QF_PEERS       ->  "cnv=https://cnv.example,mtv=https://mtv.example"
+      2. env QF_PEERS       ->  "team-a=https://team-a.example,team-b=https://team-b.example"
     """
     path = Path(os.environ["QF_PEERS_FILE"]) if os.environ.get("QF_PEERS_FILE") else CONFIG / "peers.yaml"
     if path.is_file():
@@ -4601,6 +4517,7 @@ def _list_artifacts(jira_id: str) -> list[dict]:
     artifact_map = [
         ("stp", f"{jira_id}/stp/{jira_id}_test_plan.md", "STP"),
         ("stp_review", f"{jira_id}/reviews/{jira_id}_stp_review.md", "STP Review"),
+        ("regression_analysis", f"{jira_id}/stp/{jira_id}_regression_analysis.yaml", "Regression Analysis"),
         ("std", f"{jira_id}/std/{jira_id}_test_description.yaml", "STD"),
         ("std_review", f"{jira_id}/reviews/{jira_id}_std_review.md", "STD Review"),
         ("stp_refinement_log", f"{jira_id}/reviews/{jira_id}_stp_refinement_log.md", "STP Refinement Log"),
@@ -5037,6 +4954,7 @@ def get_project(project_id: str):
             "tier2": repos.get("tier2_repo", {}),
             "additional": repos.get("additional_repos", []),
         },
+        "repos": _repo_rows(repos),
         "components": list(components.get("component_package_map", {}).keys()),
         "environment": env,
         "jira": {
@@ -5246,6 +5164,153 @@ async def create_project(request: Request, x_api_key: str = Header(default="")):
     return {"status": "created", "project_id": project_id, "config_dir": str(proj_dir.relative_to(CONFIG))}
 
 
+def _repo_entry(full_name: str, language: str = "") -> dict:
+    """A repositories.yaml entry in full. The default branch and language come
+    from GitHub when it answers (public repo, or the pod's token); otherwise
+    "main" and the given language. local_path_env names the variable that
+    points at the repo's local checkout: {NAME}_REPO_PATH."""
+    org, name = full_name.split("/", 1)
+    info = _github_api_get(f"https://api.github.com/repos/{full_name}") or {}
+    entry = {
+        "name": name, "org": org, "full_name": full_name,
+        "url": f"https://github.com/{full_name}",
+        "local_path_env": re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") + "_REPO_PATH",
+        "default_branch": info.get("default_branch") or "main",
+    }
+    lang = language or (info.get("language") or "").lower()
+    if lang:
+        entry["language"] = lang
+    return entry
+
+
+# Role -> repositories.yaml key. The same four as /add-repo --type.
+_REPO_SLOTS = {"primary": "primary_repo", "tier2": "tier2_repo",
+               "design_docs": "design_docs_repo", "additional": "additional_repos"}
+
+
+def _parse_repo(value) -> str | None:
+    """org/repo from "org/repo" or a GitHub URL (.git and a trailing / dropped);
+    None for anything else."""
+    s = re.sub(r"^(https?://)?(www\.)?github\.com/", "", str(value or "").strip()).rstrip("/")
+    s = re.sub(r"\.git$", "", s)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", s) or {".", ".."} & set(s.split("/")):
+        return None
+    return s
+
+
+def _full_name(entry) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    if entry.get("full_name"):
+        return str(entry["full_name"])
+    return f"{entry['org']}/{entry['name']}" if entry.get("org") and entry.get("name") else ""
+
+
+def _put_repo(repos_cfg: dict, role: str, entry: dict) -> dict:
+    """Write one _repo_entry into repositories.yaml data, by /add-repo's rules:
+    a slot is replaced, keeping the team's own keys (build_command, ...) when it
+    already holds the same repo; a context repo is appended, or completes the
+    entry for the same repo without dropping its keys."""
+    slot = _REPO_SLOTS[role]
+    if role == "additional":
+        additional = repos_cfg.get(slot) or []
+        for i, r in enumerate(additional):
+            if _full_name(r) == entry["full_name"]:
+                additional[i] = {**entry, **r}
+                break
+        else:
+            additional.append(entry)
+        repos_cfg[slot] = additional
+    else:
+        prior = repos_cfg.get(slot) or {}
+        repos_cfg[slot] = {**entry, **prior} if _full_name(prior) == entry["full_name"] else entry
+        if slot == "primary_repo":
+            repos_cfg[slot].setdefault("build_system", "")
+    return repos_cfg
+
+
+def _repo_rows(repos_cfg: dict) -> list[dict]:
+    """The project's repos for the settings page, with their checkout status:
+    checked out when the variable named by local_path_env is set in this
+    process and names an existing directory. Only a directory is echoed back,
+    so a local_path_env pointing at some other variable leaks nothing."""
+    rows = []
+    for role, slot in _REPO_SLOTS.items():
+        entries = repos_cfg.get(slot) or []
+        for e in entries if isinstance(entries, list) else [entries]:
+            name = _full_name(e)
+            if not name:
+                continue
+            var = str(e.get("local_path_env") or "")
+            path = os.environ.get(var, "") if var else ""
+            checked_out = bool(path) and os.path.isdir(path)
+            url = str(e.get("url") or "")
+            rows.append({
+                "role": role, "full_name": name,
+                "url": url if url.startswith("https://") else f"https://github.com/{name}",
+                "language": e.get("language", ""),
+                "checked_out": checked_out, "checkout_path": path if checked_out else "",
+            })
+    return rows
+
+
+async def _repo_request(request: Request, project_id: str) -> tuple[Path, str, str]:
+    """Project dir, org/repo and role from a {repo, role} body, validated.
+    project_id: already through _safe_path_segment."""
+    proj_dir = CONFIG / "projects" / project_id
+    if not proj_dir.is_dir():
+        raise HTTPException(404, f"Project '{project_id}' not found")
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    body = body if isinstance(body, dict) else {}
+    full_name = _parse_repo(body.get("repo"))
+    if not full_name:
+        raise HTTPException(400, "repo: use org/repo or https://github.com/org/repo")
+    role = body.get("role")
+    if role not in _REPO_SLOTS:
+        raise HTTPException(400, f"role: one of {', '.join(_REPO_SLOTS)}")
+    return proj_dir, full_name, role
+
+
+@app.post("/api/projects/{project_id}/repos")
+async def add_project_repo(project_id: str, request: Request, x_api_key: str = Header(default="")):
+    """Add one repo (project settings > Repositories). JSON body: {repo, role},
+    role primary | tier2 | design_docs | additional. Same entry and slot rules
+    as /add-repo and import-repos."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    proj_dir, full_name, role = await _repo_request(request, _safe_path_segment(project_id))
+    entry = _repo_entry(full_name)  # GitHub lookup outside the file lock
+    cfg = _atomic_yaml_update(proj_dir / "repositories.yaml", lambda c: _put_repo(c, role, entry))
+    if os.environ.get("QF_REPOS_DIR"):  # clone now, not at the next sync pass
+        threading.Thread(target=_sync_team_repos, daemon=True).start()
+    return {"status": "ok", "repos": _repo_rows(cfg)}
+
+
+@app.delete("/api/projects/{project_id}/repos")
+async def remove_project_repo(project_id: str, request: Request, x_api_key: str = Header(default="")):
+    """Remove a context repo, or clear the tier2/design_docs slot when it holds
+    this repo. JSON body: {repo, role}. The tests repo is replaced, never removed."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    proj_dir, full_name, role = await _repo_request(request, _safe_path_segment(project_id))
+    if role == "primary":
+        raise HTTPException(400, "The tests repo can be replaced, not removed")
+    slot = _REPO_SLOTS[role]
+
+    def drop(c):
+        if role == "additional":
+            if c.get(slot):
+                c[slot] = [r for r in c[slot] if _full_name(r) != full_name]
+        elif _full_name(c.get(slot)) == full_name:
+            c.pop(slot)
+        return c
+    cfg = _atomic_yaml_update(proj_dir / "repositories.yaml", drop)
+    return {"status": "ok", "repos": _repo_rows(cfg)}
+
+
 @app.post("/api/projects/{project_id}/import-repos")
 async def import_repos(project_id: str, request: Request, x_api_key: str = Header(default="")):
     """Import multiple repositories into a project from a YAML/JSON list.
@@ -5253,8 +5318,12 @@ async def import_repos(project_id: str, request: Request, x_api_key: str = Heade
     JSON body:
         repos: list of {url, type?, language?}
             url: "https://github.com/org/repo" or "org/repo"
-            type: "primary" | "tier2" | "additional" (default: "additional")
+            type: "primary" | "tier2" | "design_docs" | "additional" (default: "additional")
             language: "go" | "python" | "java" | "rust" (auto-detected if omitted)
+
+    Each entry is written in full (name, org, url, default_branch, language,
+    local_path_env), the shape /add-repo writes: without local_path_env the
+    analysis steps never find the repo's checkout.
     """
     _check_rate_limit(request)
     _check_api_key_or_origin(request, x_api_key)
@@ -5276,16 +5345,15 @@ async def import_repos(project_id: str, request: Request, x_api_key: str = Heade
         if isinstance(entry, str):
             entry = {"url": entry}
         url = entry.get("url", "").strip()
-        # Parse org/repo from URL
-        url_clean = re.sub(r"^https?://", "", url).rstrip("/")
-        url_clean = re.sub(r"^github\.com/", "", url_clean)
-        parts = url_clean.split("/")
-        if len(parts) < 2 or not parts[0] or not parts[1]:
+        full_name = _parse_repo(url)
+        if not full_name:
             results.append({"url": url, "status": "error", "error": "Invalid format. Use org/repo or https://github.com/org/repo"})
             continue
-        org, repo_name = parts[0], parts[1]
-        full_name = f"{org}/{repo_name}"
+        org, repo_name = full_name.split("/")
         repo_type = entry.get("type", "additional").strip().lower()
+        if repo_type not in _REPO_SLOTS:
+            results.append({"url": url, "status": "error", "error": f"type: one of {', '.join(_REPO_SLOTS)}"})
+            continue
         language = entry.get("language", "").strip().lower()
         parsed_repos.append({"full_name": full_name, "org": org, "repo": repo_name,
                              "type": repo_type, "language": language})
@@ -5295,23 +5363,17 @@ async def import_repos(project_id: str, request: Request, x_api_key: str = Heade
         raise HTTPException(400, "No valid repos found in input")
 
     # Update repositories.yaml
-    repos_path = proj_dir / "repositories.yaml"
-    repos_cfg = _read_yaml(repos_path) if repos_path.exists() else {}
+    entries = []
     for pr in parsed_repos:
-        repo_entry = {"full_name": pr["full_name"]}
-        if pr["language"]:
-            repo_entry["language"] = pr["language"]
-        if pr["type"] == "primary":
-            repo_entry["build_system"] = ""
-            repos_cfg["primary_repo"] = repo_entry
-        elif pr["type"] == "tier2":
-            repos_cfg["tier2_repo"] = repo_entry
-        else:
-            additional = repos_cfg.get("additional_repos", [])
-            if not any(r.get("full_name") == pr["full_name"] for r in additional):
-                additional.append(repo_entry)
-            repos_cfg["additional_repos"] = additional
-    _write_yaml(repos_path, repos_cfg)
+        repo_entry = _repo_entry(pr["full_name"], pr["language"])
+        pr["language"] = repo_entry.get("language", "")
+        entries.append((pr["type"], repo_entry))
+
+    def put_all(cfg):
+        for role, repo_entry in entries:
+            _put_repo(cfg, role, repo_entry)
+        return cfg
+    _atomic_yaml_update(proj_dir / "repositories.yaml", put_all)
 
     # Update coverage.yaml — add repos for coverage tracking
     cov_path = proj_dir / "coverage.yaml"
@@ -5898,7 +5960,7 @@ def _ticket_maintenance(jira_id: str):
 
 def _run_phase_background(jira_id: str, phase: str, model: str = "",
                           request_id: str | None = None, creds: dict | None = None,
-                          runtime: str = "claude", actor: str = "-", rereview: bool = False):
+                          runtime: str | None = None, actor: str = "-", rereview: bool = False):
     """Execute a pipeline phase in a background thread.
 
     request_id is the id of the request that started this run: contextvars do
@@ -5908,13 +5970,16 @@ def _run_phase_background(jira_id: str, phase: str, model: str = "",
     creds carries the clicking user's own Jira/GitHub/Cursor/Codex/Vertex identity
     (never logged, never persisted — see run_pipeline_phase) so a shared dashboard
     still attributes each run to the person who triggered it, not one server
-    token. runtime selects the backend ("claude" | "cursor" | "codex").
+    token. runtime selects the backend ("claude" | "cursor" | "codex"); absent
+    or unknown means _RUNNER_DEFAULT_RUNTIME.
     actor is the clicking user (_resolve_actor) for the request_changes audit
     row a completed *_refine run writes — there is no request in this thread.
     rereview: a *_refine on a document edited since its last review (decided at
     accept time by the run route) — the command re-reviews before fixing."""
     if request_id:
         _request_id_ctx.set(request_id)
+    if runtime not in _RUNTIMES:
+        runtime = _RUNNER_DEFAULT_RUNTIME
     key = f"{jira_id}/{phase}"
     error_msg = ""
     run_started = time.time()
@@ -5966,6 +6031,8 @@ def _run_phase_background(jira_id: str, phase: str, model: str = "",
             actual_model = model or result.get("model")
             if actual_model:
                 phase_data["model"] = actual_model
+            if result.get("lsp") is not None:
+                phase_data["lsp"] = result["lsp"]
             phase_data["skill_version"] = _compute_skill_version()
             phase_data["finished_ts"] = datetime.now(timezone.utc).isoformat()
             _record_phase_result(state.setdefault("phases", {}), phase, phase_data)
@@ -6079,10 +6146,14 @@ async def get_runner_models():
     ponytail: shape changed from the old flat {default,models} to
     {claude:{...}, cursor:{...}, codex:{...}} — the only consumer is ui/index.html's
     loadRunnerModels(), updated in the same change; no versioned/legacy
-    response needed for a single first-party caller."""
+    response needed for a single first-party caller.
+
+    default_runtime is the runtime a person gets until they pick one in
+    Settings (QF_RUNNER_DEFAULT_RUNTIME, "codex" unless set)."""
     cursor_labels = {mid: _CURSOR_MODEL_LABELS[mid]
                      for mid in _RUNNER_CURSOR_MODELS if mid in _CURSOR_MODEL_LABELS}
     return {
+        "default_runtime": _RUNNER_DEFAULT_RUNTIME,
         "claude": {
             "default": _RUNNER_MODEL_DEFAULT,
             "models": _RUNNER_MODELS,
@@ -6095,8 +6166,8 @@ async def get_runner_models():
             "labels": cursor_labels,
             # True when this process has CURSOR_API_KEY (local .env). Does
             # not reveal the key. Lets a laptop dashboard run Cursor without a
-            # second paste into Settings; cnv2 leaves this false so each
-            # person still pastes their own key.
+            # second paste into Settings; a shared deployment leaves this
+            # false so each person still pastes their own key.
             "env_key": bool(os.environ.get("CURSOR_API_KEY")),
         },
         "codex": {
@@ -6140,11 +6211,11 @@ async def run_pipeline_phase(jira_id: str, phase: str, request: Request, x_api_k
 
     # Runtime selector: exactly "claude" | "cursor" | "codex" — no
     # case-folding, this is a value match, not free text. Anything
-    # absent/empty/unrecognized silently falls back to "claude" — never a 400
-    # for this field.
+    # absent/empty/unrecognized silently falls back to the server default
+    # (QF_RUNNER_DEFAULT_RUNTIME, "codex" unless set) — never a 400 for this field.
     runtime = body.get("runtime")
-    if runtime not in ("claude", "cursor", "codex"):
-        runtime = "claude"
+    if runtime not in _RUNTIMES:
+        runtime = _RUNNER_DEFAULT_RUNTIME
 
     # The Vertex-availability gate only applies to the Claude runtime — Cursor
     # brings its own per-user credential (cursor_api_key below) and has no
@@ -6326,13 +6397,20 @@ async def run_pipeline_phase(jira_id: str, phase: str, request: Request, x_api_k
             # The pre-refine document, for "What changed" once the run finishes.
             _snapshot_to_previous(_artifact_path(jira_id, parent),
                                   datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+            # Notes other reviewers added since the last refine (Add note, Pull PR
+            # comments) go into this run too, then the queue starts empty.
+            pending = _pending_notes_path(jira_id, parent)
+            queued = pending.read_text(errors="replace").strip() if pending.exists() else ""
             if feedback:
+                queued += (("\n\n" if queued else "") +
+                           f"<!-- {actor} {datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n"
+                           f"{feedback}")
+            if queued:
                 notes.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write_text(notes, f"<!-- Reviewer notes from the dashboard, {actor} "
-                                          f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n"
-                                          f"{feedback}\n")
+                _atomic_write_text(notes, f"<!-- Reviewer notes from the dashboard -->\n{queued}\n")
             else:
                 notes.unlink(missing_ok=True)
+            pending.unlink(missing_ok=True)
         except OSError:
             logger.exception("Could not snapshot the document or save reviewer notes for %s/%s",
                              jira_id, phase)
@@ -6747,7 +6825,7 @@ def _get_target_repo(project_id: str, tier: str = "primary") -> dict:
     """Get the target repository from project config.
 
     Args:
-        project_id: Project ID (e.g., 'cnv')
+        project_id: Project ID (e.g., 'example')
         tier: 'primary' for Go/tier1 repo, 'tier2' for Python repo
 
     Returns dict with keys: full_name, default_branch, platform, url
@@ -6923,6 +7001,21 @@ def _github_find_pr(upstream_repo: str, head: str, token: str) -> dict:
     return {"url": "", "number": 0, "state": "unknown", "error": "PR exists but could not be found"}
 
 
+# pytest's default python_files. Most tests repos keep it, and pytest
+# collects any other name only when the file is named on the command line,
+# so a qf_{feature}.py pushed to such a repo is never run by its CI.
+# ponytail: assumes the target repo keeps the default; read its pytest.ini at
+# push time if a target ever overrides python_files.
+_PYTEST_PYTHON_FILES = ("test_*.py", "*_test.py")
+_PY_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def test_", re.M)
+
+
+def _pytest_never_collects(name: str, content: str) -> bool:
+    """A module with test functions whose name pytest's python_files skips.
+    conftest.py and helper modules hold no `def test_`, so they pass."""
+    return (not any(fnmatch.fnmatch(name, p) for p in _PYTEST_PYTHON_FILES)
+            and _PY_TEST_DEF_RE.search(content) is not None)
+
 
 def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
     """Collect output files grouped by target repo tier.
@@ -6932,12 +7025,23 @@ def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
     """
     groups: dict[str, list[dict]] = {"primary": [], "tier2": [], "docs": []}
 
+    def _targets(d: Path) -> dict[str, str]:
+        """file name -> its path in the tests repo, from the summary.yaml codegen
+        writes (it generates inside a checkout of that repo)."""
+        try:
+            files = (_read_yaml(d / "summary.yaml") or {}).get("files") or []
+        except Exception:
+            return {}
+        return {f["name"]: f["target_path"] for f in files
+                if isinstance(f, dict) and f.get("name") and f.get("target_path")}
+
     # Go test files → primary repo. Only the qf_ generated tests, skip caches.
     go_dir = _pick_dir(*_test_dirs(jira_id, "go"))
     if go_dir:
+        where = _targets(go_dir)
         for f in sorted(go_dir.glob("qf_*.go")):
             groups["primary"].append({
-                "path": f"tests/qualityflow/{jira_id}/{f.name}",
+                "path": where.get(f.name, f"tests/qualityflow/{jira_id}/{f.name}"),
                 "content": f.read_text(errors="replace"),
                 "source": str(f),
             })
@@ -6946,9 +7050,10 @@ def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
     # skip summary.yaml and __pycache__.
     py_dir = _pick_dir(*_test_dirs(jira_id, "python"))
     if py_dir:
+        where = _targets(py_dir)
         for f in sorted(py_dir.glob("*.py")):
             groups["tier2"].append({
-                "path": f"tests/qualityflow/{jira_id}/{f.name}",
+                "path": where.get(f.name, f"tests/qualityflow/{jira_id}/{f.name}"),
                 "content": f.read_text(errors="replace"),
                 "source": str(f),
             })
@@ -6969,6 +7074,186 @@ def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
                     })
 
     return groups
+
+
+def _git_blob_sha(content: str) -> str:
+    """The sha GitHub's contents API reports for a file with this content."""
+    data = content.encode()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _pending_notes_path(jira_id: str, phase: str) -> Path:
+    """Reviewer notes queued for the next Request changes on `phase` (stp/std):
+    several people add theirs, and one refine applies them all."""
+    return OUTPUTS / jira_id / "reviews" / f"{jira_id}_{phase}_notes_pending.md"
+
+
+def _append_pending_note(jira_id: str, phase: str, who: str, text: str) -> None:
+    path = _pending_notes_path(jira_id, phase)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = (f"<!-- {who} {datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n"
+             f"{text.strip()}\n")
+    with _yaml_lock(path):
+        prior = path.read_text(errors="replace") if path.exists() else ""
+        _atomic_write_text(path, prior + ("\n" if prior else "") + block)
+
+
+_NOTE_HEADER_RE = re.compile(r"^<!-- (.+?) (\d{4}-\d\d-\d\dT[^ ]+) -->$", re.M)
+
+
+def _read_pending_notes(jira_id: str, phase: str) -> list[dict]:
+    path = _pending_notes_path(jira_id, phase)
+    text = path.read_text(errors="replace") if path.exists() else ""
+    heads = list(_NOTE_HEADER_RE.finditer(text))
+    return [{"who": h.group(1), "at": h.group(2),
+             "text": text[h.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)].strip()}
+            for i, h in enumerate(heads)]
+
+
+def _check_notes_phase(jira_id: str, phase: str) -> None:
+    if not re.match(r"^[A-Z]+-\d+$", jira_id):
+        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
+    if phase not in ("stp", "std"):
+        raise HTTPException(400, "Notes are for the stp or std phase")
+
+
+@app.get("/api/pipelines/{jira_id}/notes/{phase}")
+def get_pending_notes(jira_id: str, phase: str):
+    _check_notes_phase(jira_id, phase)
+    return {"notes": _read_pending_notes(jira_id, phase)}
+
+
+@app.post("/api/pipelines/{jira_id}/notes/{phase}")
+async def add_pending_note(jira_id: str, phase: str, request: Request, x_api_key: str = Header(default="")):
+    """Queue one reviewer's note; the next Request changes applies every queued note."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    _check_notes_phase(jira_id, phase)
+    try:
+        body = (await request.json()) or {}
+    except Exception:
+        body = {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "The note is empty")
+    if len(text) > 4000:
+        raise HTTPException(400, "The note is too long (max 4000 characters)")
+    who = await asyncio.to_thread(_resolve_actor, request, x_api_key, body, _infer_project(jira_id))
+    # A claimed display name labels the note for the author; it is not attribution.
+    name = str(body.get("display_name") or "").strip()[:64]
+    _append_pending_note(jira_id, phase, name or who, text)
+    _audit("add_note", who, jira_id=jira_id, phase=phase)
+    return {"notes": _read_pending_notes(jira_id, phase)}
+
+
+def _pr_target(jira_id: str) -> tuple[str, int]:
+    info = _read_pr_info(jira_id) or {}
+    repo, number = info.get("target_repo"), info.get("number")
+    if not (repo and number):
+        raise HTTPException(404, f"No pull request recorded for {jira_id} — Push to PR first")
+    return repo, int(number)
+
+
+def _is_bot(login: str) -> bool:
+    return not login or login.endswith("[bot]")
+
+
+@app.post("/api/pipelines/{jira_id}/pull-pr-comments")
+async def pull_pr_comments(jira_id: str, request: Request, x_api_key: str = Header(default="")):
+    """Queue the review comments people left on the ticket's PR as reviewer
+    notes, so the next Request changes edits the document with them instead
+    of anyone retyping them. Only comments newer than the last pull."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    _check_notes_phase(jira_id, "stp")
+    try:
+        body = (await request.json()) or {}
+    except Exception:
+        body = {}
+    repo, number = _pr_target(jira_id)
+    token = str(body.get("github_token") or "").strip()
+    since = (_read_pr_info(jira_id) or {}).get("comments_pulled_at") or ""
+    base = f"https://api.github.com/repos/{repo}"
+    found: list[tuple[str, str, str]] = []  # (created_at, login, text)
+    for path, kind in ((f"/pulls/{number}/comments", "line"), (f"/pulls/{number}/reviews", "review"),
+                       (f"/issues/{number}/comments", "comment")):
+        items = _github_api_get(base + path + "?per_page=100", token) or []
+        for c in items if isinstance(items, list) else []:
+            login = (c.get("user") or {}).get("login") or ""
+            text = (c.get("body") or "").strip()
+            when = c.get("created_at") or c.get("submitted_at") or ""
+            if _is_bot(login) or not text or when <= since:
+                continue
+            where = f" on {c['path']}:{c.get('line') or c.get('original_line') or ''}" if kind == "line" and c.get("path") else ""
+            found.append((when, login, f"{text}\n(from the PR{where}: {c.get('html_url', '')})"))
+    for when, login, text in sorted(found):
+        _append_pending_note(jira_id, "stp", f"@{login}", text)
+    info = _read_pr_info(jira_id) or {}
+    info["comments_pulled_at"] = max([since] + [w for w, _, _ in found])
+    _write_pr_info(jira_id, info)
+    who = await asyncio.to_thread(_resolve_actor, request, x_api_key, body, _infer_project(jira_id))
+    _audit("pull_pr_comments", who, jira_id=jira_id, pulled=len(found))
+    return {"pulled": len(found), "notes": _read_pending_notes(jira_id, "stp")}
+
+
+@app.get("/api/pipelines/{jira_id}/reviewers")
+def get_pr_reviewers(jira_id: str):
+    """Peer review on the ticket's PR: who was asked, who reviewed (and how),
+    and people to suggest — the STP's stakeholders that have a GitHub handle."""
+    if not re.match(r"^[A-Z]+-\d+$", jira_id):
+        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
+    suggested = []
+    side = OUTPUTS / jira_id / "stp" / f"{jira_id}_stakeholders.yaml"
+    if side.exists():
+        try:
+            doc = _read_yaml(side)
+            people = doc.get("stakeholders", doc) if isinstance(doc, dict) else doc
+            suggested = [{"github": p["github"], "name": p.get("name") or "", "role": p.get("role") or ""}
+                         for p in people or [] if isinstance(p, dict) and p.get("github")]
+        except Exception:
+            logger.exception("Could not read %s", side)
+    info = _read_pr_info(jira_id) or {}
+    if not (info.get("target_repo") and info.get("number")):
+        return {"pr": None, "requested": [], "reviews": [], "suggested": suggested}
+    base = f"https://api.github.com/repos/{info['target_repo']}/pulls/{info['number']}"
+    req = _github_api_get(base + "/requested_reviewers") or {}
+    reviews = _github_api_get(base + "/reviews?per_page=100") or []
+    latest: dict[str, str] = {}
+    for r in reviews if isinstance(reviews, list) else []:
+        login = (r.get("user") or {}).get("login") or ""
+        if not _is_bot(login) and r.get("state") != "PENDING":
+            latest[login] = r.get("state", "")
+    return {"pr": info.get("url"),
+            "requested": [u.get("login") for u in (req.get("users") or []) if u.get("login")],
+            "reviews": [{"login": k, "state": v} for k, v in latest.items()],
+            "suggested": suggested}
+
+
+@app.post("/api/pipelines/{jira_id}/request-review")
+async def request_pr_review(jira_id: str, request: Request, x_api_key: str = Header(default="")):
+    """Ask people to review the ticket's PR. Peer review is additive: it
+    never gates the pipeline — approval stays the dashboard's own gate."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    try:
+        body = (await request.json()) or {}
+    except Exception:
+        body = {}
+    repo, number = _pr_target(jira_id)
+    logins = [str(x).strip().lstrip("@") for x in (body.get("reviewers") or []) if str(x).strip()]
+    if not logins or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", x) for x in logins):
+        raise HTTPException(400, "Give one or more GitHub usernames")
+    token = str(body.get("github_token") or "").strip() or ("" if _members_isolated() else _GITHUB_TOKEN)
+    if not token:
+        raise HTTPException(400, "Paste your GitHub token in Settings — the request is sent as you.")
+    try:
+        _github_api("POST", f"https://api.github.com/repos/{repo}/pulls/{number}/requested_reviewers",
+                    token, {"reviewers": logins})
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    who = await asyncio.to_thread(_resolve_actor, request, x_api_key, body, _infer_project(jira_id))
+    _audit("request_review", who, jira_id=jira_id, reviewers=",".join(logins))
+    return {"requested": logins}
 
 
 _stp_folder_cache: dict[str, tuple[list[str], float]] = {}  # repo → (folders, fetched_ts)
@@ -7016,17 +7301,23 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
     if not re.match(r"^[A-Z]+-\d+$", jira_id):
         raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
 
-    # Check for existing PR. A closed one doesn't block a new push: it was
-    # abandoned (e.g. opened against the wrong repo) and the new PR replaces it.
-    existing = _read_pr_info(jira_id)
-    if existing and existing.get("url") and existing.get("state") != "closed":
-        return {"status": "existing", "pr": existing, "message": "PR already exists for this ticket"}
+    # An open PR is updated in place: a refine or edit after the push lands as
+    # a new commit on the same branch, so reviewers see it where they review.
+    # A closed one doesn't block a new push: it was abandoned (e.g. opened
+    # against the wrong repo) and the new PR replaces it.
+    existing = _read_pr_info(jira_id) or {}
+    updating = bool(existing.get("url")) and existing.get("state") == "open"
+    if existing.get("url") and existing.get("state") == "merged":
+        return {"status": "existing", "pr": existing,
+                "message": "This ticket's PR is merged — change the document in its repo"}
 
     # Parse optional body
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if updating and not body.get("stp_folder") and existing.get("stp_folder"):
+        body["stp_folder"] = existing["stp_folder"]
 
     project_id = _infer_project(jira_id)
     target = _get_target_repo(project_id, "primary")
@@ -7053,7 +7344,28 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
     # Collect files grouped by tier
     file_groups = _collect_pr_files(jira_id)
 
-    # A project with a design_docs_repo (CNV) keeps STPs there, under
+    # Refuse, before any GitHub call, Python tests the target repo's CI would
+    # never collect: they would land as dead files that look delivered.
+    uncollected = [Path(f["path"]).name for f in file_groups["tier2"]
+                   if _pytest_never_collects(Path(f["path"]).name, f["content"])]
+    if uncollected:
+        raise HTTPException(400, f"pytest would never collect {', '.join(uncollected)}: "
+                                 "name them test_qf_<feature>.py (python_files is test_*.py *_test.py), "
+                                 "or Reset Phase > Code Generation and generate again.")
+
+    # Tests reach the team's repo only once they collected inside a checkout
+    # of it (codegen's `verification`). Unverified tests stay here; the STP,
+    # if any, still goes.
+    tests_skipped = ""
+    codegen = ((_read_state(_state_dir(jira_id) / "pipeline_state.yaml") or {}).get("phases") or {}).get("codegen") or {}
+    if (file_groups["primary"] or file_groups["tier2"]) and codegen.get("verification") != "passed":
+        tests_skipped = ("generated tests not pushed: they did not pass collection in the tests repo "
+                         f"({codegen.get('verification') or 'not verified'}"
+                         f"{': ' + str(codegen['verification_reason']) if codegen.get('verification_reason') else ''})")
+        file_groups["primary"] = [f for f in file_groups["primary"] if not f["path"].endswith(".go")]
+        file_groups["tier2"] = []
+
+    # A project with a design_docs_repo keeps STPs there, under
     # stps/<folder>/: the STP alone goes to that repo, chosen folder, and any
     # generated tests go to the primary (test) repo as a second PR. STD,
     # reviews and the intermediate yaml are pushed nowhere.
@@ -7097,6 +7409,8 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
         all_files = all_files + file_groups["tier2"]
 
     if not all_files and not file_groups["tier2"]:
+        if tests_skipped:
+            raise HTTPException(409, tests_skipped[0].upper() + tests_skipped[1:])
         raise HTTPException(404, f"No output files found for {jira_id}")
 
     try:
@@ -7117,19 +7431,40 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
                     _github_api("POST", f"https://api.github.com/repos/{push_repo}/merge-upstream", token, {"branch": base_branch})
                 except RuntimeError:
                     pass
-            base_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/ref/heads/{base_branch}", token)
-            base_sha = base_info["object"]["sha"]
+            # Updating an open PR: commit on top of its branch (keeping anyone's
+            # commits there), unless a file we pushed was changed on GitHub since
+            # — overwriting a reviewer's edit is worse than refusing.
+            head_sha = None
+            if updating:
+                ref = _github_api_get(f"https://api.github.com/repos/{push_repo}/git/ref/heads/"
+                                      f"{urllib.parse.quote(branch_name, safe='')}", token)
+                head_sha = ((ref or {}).get("object") or {}).get("sha")
+            if head_sha:
+                pushed = existing.get("pushed_blobs") or {}
+                for f in files:
+                    remote = _github_api_get(f"https://api.github.com/repos/{push_repo}/contents/"
+                                             f"{urllib.parse.quote(f['path'])}?ref={head_sha}", token) or {}
+                    if pushed.get(f["path"]) and remote.get("sha") and remote["sha"] != pushed[f["path"]]:
+                        raise HTTPException(409, f"{f['path']} was changed on the PR since QualityFlow pushed it. "
+                                                 "Pull PR comments or copy the change into the document first, "
+                                                 "so the push does not overwrite it.")
+                base_sha = head_sha
+            else:
+                base_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/ref/heads/{base_branch}", token)
+                base_sha = base_info["object"]["sha"]
             commit_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/commits/{base_sha}", token)
             base_tree_sha = commit_info["tree"]["sha"]
 
             # Create tree + commit on push_repo (fork or upstream)
             tree_sha = _github_create_tree(push_repo, base_tree_sha, files, token)
             file_list = "\n".join(f"  - {f['path']}" for f in files)
-            commit_msg = f"QualityFlow: test artifacts for {jira_id}\n\nAuto-generated files:\n{file_list}\n\nGenerated by QualityFlow pipeline."
+            commit_msg = (f"QualityFlow: {'update' if head_sha else 'test artifacts'} for {jira_id}\n\n"
+                          f"Files:\n{file_list}\n\nGenerated by QualityFlow pipeline.")
             commit_sha = _github_create_commit(push_repo, commit_msg, tree_sha, base_sha, token)
 
             # Create/update branch on push_repo
-            _github_create_branch(push_repo, branch_name, commit_sha, token)
+            if not head_sha:
+                _github_create_branch(push_repo, branch_name, commit_sha, token)
             _github_update_ref(push_repo, branch_name, commit_sha, token)
 
             # Create PR on upstream — head is 'user:branch' for forks, 'branch' for same-repo
@@ -7177,9 +7512,18 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
             "url": pr_result.get("url", ""),
             "number": pr_result.get("number"),
             "state": pr_result.get("state", "open"),
-            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "created": existing.get("created") if updating else datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "files": [f["path"] for f in all_files],
+            # git blob shas of what we pushed: the next update refuses to
+            # overwrite a file someone changed on the PR in between.
+            "pushed_blobs": {f["path"]: _git_blob_sha(f["content"])
+                             for f in all_files + file_groups["tier2"]},
         }
+        if body.get("stp_folder"):
+            pr_info["stp_folder"] = body["stp_folder"]
+        if existing.get("comments_pulled_at") and updating:
+            pr_info["comments_pulled_at"] = existing["comments_pulled_at"]
         if tier2_pr_info:
             pr_info["tier2_pr"] = {
                 "target_repo": tier2_target["full_name"],
@@ -7195,11 +7539,14 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
 
         _audit("push_pr", await asyncio.to_thread(_resolve_actor, request, x_api_key, body, project_id),
                jira_id=jira_id,
-               result="created", url=pr_info.get("url", ""))
-        return {"status": "created", "pr": pr_info}
+               result="updated" if updating else "created", url=pr_info.get("url", ""))
+        return {"status": "updated" if updating else "created", "pr": pr_info,
+                **({"skipped": tests_skipped} if tests_skipped else {})}
 
     except RuntimeError as e:
         raise HTTPException(502, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Push to PR failed for %s", jira_id)
         raise HTTPException(500, f"Failed to push PR: {e}")
@@ -7224,11 +7571,21 @@ def _get_approval_gates(project_id: str) -> list[str]:
 
 
 def _read_approvals(jira_id: str) -> dict:
-    """Read approval state from state file."""
+    """Read approval state from state file.
+
+    Decisions sit at the top level (this module and `state.py approve` write
+    them there); a file written by hand from older docs nests them under
+    `approvals:`. Both count, the top level winning: reading only one shape
+    left a hand-written approval invisible here while the CLI gate passed,
+    and a dashboard approval invisible to the CLI."""
     approvals_file = _state_dir(jira_id) / "approvals.yaml"
-    if approvals_file.exists():
-        return _read_yaml(approvals_file)
-    return {}
+    if not approvals_file.exists():
+        return {}
+    doc = _read_yaml(approvals_file)
+    wrapped = doc.get("approvals")
+    merged = dict(wrapped) if isinstance(wrapped, dict) else {}
+    merged.update({k: v for k, v in doc.items() if k != "approvals"})
+    return merged
 
 
 def _write_approvals(jira_id: str, approvals: dict) -> None:
@@ -7585,7 +7942,8 @@ _PHASE_ORDER = ["stp", "std", "codegen"]
 # patterns: "{sub}/{id}/...") — _phase_output_targets() also derives the
 # canonical "{id}/{sub}/..." counterpart so reset clears both layouts.
 _PHASE_OUTPUTS: dict[str, list[str]] = {
-    "stp": ["stp/{id}/{id}_test_plan.md", "reviews/{id}/{id}_stp_review.md",
+    "stp": ["stp/{id}/{id}_test_plan.md", "stp/{id}/{id}_regression_analysis.yaml",
+            "reviews/{id}/{id}_stp_review.md",
             "reviews/{id}/{id}_stp_refinement_log.md", "reviews/{id}/{id}_stp_feedback.md"],
     "std": ["std/{id}/", "reviews/{id}/{id}_std_review.md",
             "reviews/{id}/{id}_std_refinement_log.md", "reviews/{id}/{id}_std_feedback.md"],
@@ -7876,6 +8234,12 @@ _STP_REQ_GROUP_RE = re.compile(r"^\s*-\s*\*\*\[([A-Za-z][A-Za-z0-9]*-\d+)\]\*\*\
 _STP_REQ_DEF_RE = re.compile(r"^\s*-\s*\*\*(REQ-[A-Za-z0-9-]+):\*\*\s*(.+)$")
 # Test Scenarios heading: "  - **TS-01: Some title** [e2e, P1]".
 _STP_TS_HEADING_RE = re.compile(r"^\s*-\s*\*\*TS-(\d+):\s*(.*?)\*\*\s*(?:\[([^\]]*)\])?\s*$")
+# The template's scenario line, its label before or after the id or at the end:
+# "  - *Test Scenario:* **TS-01**: [Tier 1] Verify ..." or
+# "  - *Test Scenario:* [Tier 1] **TS-01:** Verify ...".
+_STP_TS_LINE_RE = re.compile(
+    r"^\s*-\s*\*Test Scenario:\*\s*(?:\[([^\]]*)\]\s*)?\*\*TS-(\d+)(?:\*\*:|:\*\*)\s*"
+    r"(?:\[([^\]]*)\]\s*)?(.*?)\s*(?:\[([^\]]*)\])?\s*$")
 # Requirement tokens inside a group bullet's free text: fine-grained
 # REQ-{JIRA}-NN / legacy REQ-NN, or a bare Jira key.
 _REQ_TOKEN_RE = re.compile(r"REQ-[A-Za-z0-9-]+|[A-Z][A-Z0-9]*-\d+")
@@ -7904,13 +8268,17 @@ def _parse_stp_requirements(text: str, jira_id: str) -> tuple[list[str], dict[st
     """
     req_defs: list[str] = []
     ts_map: dict[str, dict] = {}
+    group_keys: list[str] = []
     try:
         pending_reqs: list[str] = []
         for line in text.splitlines():
             m_group = _STP_REQ_GROUP_RE.match(line)
             if m_group:
-                tokens = _REQ_TOKEN_RE.findall(m_group.group(2))
+                # Refs in the free text, else the bracketed key itself: the
+                # template's "- **[KEY]** — user story" names no other ref.
+                tokens = _REQ_TOKEN_RE.findall(m_group.group(2)) or [m_group.group(1)]
                 pending_reqs = [_normalize_req_id(t, jira_id) for t in tokens]
+                group_keys.extend(pending_reqs)
                 continue
             m_def = _STP_REQ_DEF_RE.match(line)
             if m_def:
@@ -7924,12 +8292,23 @@ def _parse_stp_requirements(text: str, jira_id: str) -> tuple[list[str], dict[st
                     "title": m_ts.group(2).strip(),
                     "labels": labels,
                 }
+                continue
+            m_line = _STP_TS_LINE_RE.match(line)
+            if m_line:
+                label = m_line.group(1) or m_line.group(3) or m_line.group(5) or ""
+                ts_map[f"TS-{m_line.group(2)}"] = {
+                    "requirements": pending_reqs,
+                    "title": m_line.group(4).strip(),
+                    "labels": [x.strip() for x in label.split(",") if x.strip()],
+                }
     except Exception:
         return [], {}
 
     seen: set[str] = set()
     ordered: list[str] = []
-    for r in req_defs:
+    # No "REQ-NN:" definitions (the current template has none): the group
+    # bullets' keys are the requirements.
+    for r in req_defs or group_keys:
         if r not in seen:
             seen.add(r)
             ordered.append(r)
@@ -8150,13 +8529,30 @@ def pipeline_traceability(jira_id: str):
         for rid in req_ids:
             grouped.setdefault(rid, []).append(scenario_out)
 
+    # No STD yet: the STP's own scenarios, so the view is not empty until the
+    # STD exists. link "stp" = planned only, nothing to match a test against.
+    if not std_scenarios:
+        for ts in ts_order:
+            entry = ts_map[ts]
+            scenario_out = {
+                "stp_id": ts, "std_test_id": None, "title": entry["title"], "link": "stp",
+                "tests": [], "coverage_status": None, "priority": None,
+                "test_type": ", ".join(entry["labels"]) or None, "coverage_targets": None,
+            }
+            unique_scenarios[ts] = scenario_out
+            if not entry["requirements"]:
+                orphaned.append(scenario_out)
+            for rid in entry["requirements"]:
+                grouped.setdefault(rid, []).append(scenario_out)
+
     requirements = [{"id": rid, "scenarios": grouped[rid]} for rid in req_defs]
     requirements += [{"id": rid, "scenarios": scs} for rid, scs in grouped.items() if rid not in req_defs]
 
     coverage_status_counts: dict[str, int] = {}
     for s in unique_scenarios.values():
         status = s["coverage_status"]
-        coverage_status_counts[status] = coverage_status_counts.get(status, 0) + 1
+        if status:
+            coverage_status_counts[status] = coverage_status_counts.get(status, 0) + 1
 
     summary = {
         "requirements_total": len(requirements),
@@ -8190,7 +8586,6 @@ _AUTONOMY_LADDER = [
 
 _TIER_SCRIPT = ROOT / ".github" / "review" / "tier.sh"
 _REVIEW_WORKFLOW = ROOT / ".github" / "workflows" / "ai-review.yml"
-_EVAL_CONFIG = ROOT / "eval" / "eval.yaml"
 
 
 def _read_risk_policy() -> dict:
@@ -8227,28 +8622,6 @@ def _read_risk_policy() -> dict:
         "distribution_reason": "tier.sh classifies per CI run; no run history is persisted",
     })
     return policy
-
-
-def _read_eval_suite() -> dict:
-    """Inventory of the adversarial eval suite. Case count and thresholds are
-    real; scores stay unavailable until something persists a run's results."""
-    suite: dict = {"available": False, "source": "eval/eval.yaml"}
-    cases_dir = ROOT / "eval" / "dataset" / "cases"
-    if cases_dir.is_dir():
-        suite["cases"] = sorted(p.name for p in cases_dir.iterdir() if p.is_dir())
-        suite["case_count"] = len(suite["cases"])
-    try:
-        cfg = _read_yaml(_EVAL_CONFIG)
-    except Exception:
-        cfg = {}
-    thresholds = cfg.get("thresholds") if isinstance(cfg, dict) else None
-    if isinstance(thresholds, dict):
-        suite["thresholds"] = thresholds
-        suite["available"] = True
-    # No eval runner writes results anywhere this server can read.
-    suite["latest_score"] = None
-    suite["score_reason"] = "eval-smoke runs in CI; no scored run is persisted for the dashboard to read"
-    return suite
 
 
 @app.get("/api/agentic")
@@ -8310,7 +8683,6 @@ def agentic_status():
             "recent": recent[:20],
         },
         "risk_policy": _read_risk_policy(),
-        "evals": _read_eval_suite(),
         "findings": {
             "available": False,
             "reason": ("review findings are written as prose in the review markdown, "
@@ -10179,7 +10551,7 @@ async def start_product_coverage_collection(
     coverage data. Requires dashboard running on-cluster.
 
     Query params:
-        project: project ID (e.g. 'cnv') — uses product_coverage config
+        project: project ID (e.g. 'example') — uses product_coverage config
     """
     _check_api_key_or_origin(request, x_api_key)
 
@@ -10192,7 +10564,7 @@ async def start_product_coverage_collection(
 
     project_id = request.query_params.get("project", "").strip()
     if not project_id:
-        raise HTTPException(400, "project query param is required (e.g. project=cnv)")
+        raise HTTPException(400, "project query param is required (e.g. project=example)")
 
     config = _get_product_coverage_config(project_id)
     if not config:
@@ -10245,8 +10617,8 @@ async def upload_product_coverage(request: Request, x_api_key: str = Header(defa
     and POSTs results here. The dashboard doesn't need cluster access.
 
     JSON body:
-        project: project ID (e.g. 'cnv') (required)
-        component: component name (e.g. 'virt-handler') (required)
+        project: project ID (e.g. 'example') (required)
+        component: component name (e.g. 'api') (required)
         pod: pod name that was collected from (required)
         language: 'go' or 'python' (default: 'go')
         format: coverage format — 'go-binary', 'cobertura', 'coverage-py', 'raw' (default: 'raw')
@@ -12574,7 +12946,7 @@ async def onboard_coverage(request: Request, x_api_key: str = Header(default="")
                      != urllib.parse.urlsplit(dashboard_url).netloc):
         raise HTTPException(400, "dashboard_url does not match QUALITYFLOW_BASE_URL")
 
-    # Optional: specific components to instrument (e.g. ["cmd/virt-handler"])
+    # Optional: specific components to instrument (e.g. ["cmd/api-server"])
     components = body.get("components", None)
     force = body.get("force", False)
 

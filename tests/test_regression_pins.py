@@ -30,6 +30,7 @@ Run:
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -186,7 +187,7 @@ def test_no_github_url_in_ui_py_source_interpolates_a_token():
 
 _PHASES = {"stp": {"status": "completed", "output": "stp/plan.md"},
            "std": {"status": "completed", "output": "std/desc.yaml"},
-           "codegen": {"status": "completed"}}
+           "codegen": {"status": "completed", "verification": "passed"}}
 
 
 def _state_doc(jira_id, phases=None):
@@ -202,7 +203,7 @@ def _seed_canonical(out: Path, jira_id: str, phases=None, marker: str = "canonic
     (out / jira_id / "std").mkdir(parents=True, exist_ok=True)
     (out / jira_id / "std" / f"{jira_id}_test_description.yaml").write_text("scenarios: []\n")
     (out / jira_id / "python-tests").mkdir(parents=True, exist_ok=True)
-    (out / jira_id / "python-tests" / "qf_widget.py").write_text("def test_widget():\n    pass\n")
+    (out / jira_id / "python-tests" / "test_qf_widget.py").write_text("def test_widget():\n    pass\n")
     state = out / jira_id / "state" / "pipeline_state.yaml"
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(yaml.safe_dump(_state_doc(jira_id, phases), sort_keys=False))
@@ -216,7 +217,7 @@ def _seed_legacy(out: Path, jira_id: str, phases=None, marker: str = "legacy"):
     (out / "std" / jira_id).mkdir(parents=True, exist_ok=True)
     (out / "std" / jira_id / f"{jira_id}_test_description.yaml").write_text("scenarios: []\n")
     (out / "python-tests" / jira_id).mkdir(parents=True, exist_ok=True)
-    (out / "python-tests" / jira_id / "qf_widget.py").write_text("def test_widget():\n    pass\n")
+    (out / "python-tests" / jira_id / "test_qf_widget.py").write_text("def test_widget():\n    pass\n")
     state = out / "state" / jira_id / "pipeline_state.yaml"
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(yaml.safe_dump(_state_doc(jira_id, phases), sort_keys=False))
@@ -278,7 +279,7 @@ def test_legacy_layout_reports_the_same_non_zero_metrics_as_canonical(env, tmp_p
     assert canonical["tests_generated"]["python_files"] == 1
     assert canonical["phases"]["codegen"] == "completed"
     assert canonical["swept"] == [jid]
-    assert canonical["py_tests"] == ["qf_widget.py"]
+    assert canonical["py_tests"] == ["test_qf_widget.py"]
     assert all(canonical[k] for k in ("has_state_file", "stp_resolved",
                                       "std_resolved", "state_resolved"))
 
@@ -332,7 +333,7 @@ def test_collect_pr_files_groups_and_paths(env):
     groups = ui._collect_pr_files(jid)
     assert set(groups) == {"primary", "tier2", "docs"}
     assert [f["path"] for f in groups["primary"]] == [f"tests/qualityflow/{jid}/qf_widget_test.go"]
-    assert [f["path"] for f in groups["tier2"]] == [f"tests/qualityflow/{jid}/qf_widget.py"]
+    assert [f["path"] for f in groups["tier2"]] == [f"tests/qualityflow/{jid}/test_qf_widget.py"]
     assert sorted(f["path"] for f in groups["docs"]) == [
         f"docs/qualityflow/{jid}/reviews/{jid}_stp_review.md",
         f"docs/qualityflow/{jid}/std/{jid}_test_description.yaml",
@@ -364,7 +365,7 @@ def test_python_tests_are_folded_into_the_primary_push(env, captured_requests, m
     trees = [req for req in captured_requests if "/git/trees" in req.full_url]
     assert len(trees) == 1, "expected exactly one push, not a second tier2 PR"
     pushed = _pushed_paths(captured_requests)
-    assert f"tests/qualityflow/{jid}/qf_widget.py" in pushed, pushed
+    assert f"tests/qualityflow/{jid}/test_qf_widget.py" in pushed, pushed
     assert f"docs/qualityflow/{jid}/stp/{jid}_test_plan.md" in pushed, pushed
 
 
@@ -384,8 +385,8 @@ def test_python_tests_split_out_when_a_distinct_tier2_repo_exists(env, captured_
         if "/git/trees" in req.full_url and req.data:
             repo = re.search(r"/repos/([^/]+/[^/]+)/git/trees", req.full_url).group(1)
             by_repo[repo] = [item["path"] for item in json.loads(req.data)["tree"]]
-    assert by_repo["w8org/e2e"] == [f"tests/qualityflow/{jid}/qf_widget.py"]
-    assert f"tests/qualityflow/{jid}/qf_widget.py" not in by_repo["w8org/primary"]
+    assert by_repo["w8org/e2e"] == [f"tests/qualityflow/{jid}/test_qf_widget.py"]
+    assert f"tests/qualityflow/{jid}/test_qf_widget.py" not in by_repo["w8org/primary"]
 
 
 def _trees_by_repo(captured):
@@ -398,7 +399,7 @@ def _trees_by_repo(captured):
 
 
 def test_design_docs_project_pushes_only_the_stp_there(env, captured_requests, monkeypatch):
-    """CNV keeps STPs in its design-docs repo: the STP alone goes to
+    """A project that keeps STPs in a design-docs repo: the STP alone goes to
     stps/<picked folder>/, tests go to the test repo, and STD/reviews/
     intermediate files go nowhere. It used to push all of it to the test repo."""
     jid = "PUSH-6"
@@ -417,7 +418,7 @@ def test_design_docs_project_pushes_only_the_stp_there(env, captured_requests, m
     assert r.status_code == 200, r.text
     by_repo = _trees_by_repo(captured_requests)
     assert by_repo["w8org/design-docs"] == [f"stps/sig-storage/{jid}.md"]
-    assert by_repo["w8org/tests"] == [f"tests/qualityflow/{jid}/qf_widget.py"]
+    assert by_repo["w8org/tests"] == [f"tests/qualityflow/{jid}/test_qf_widget.py"]
     assert r.json()["pr"]["target_repo"] == "w8org/design-docs"
 
 
@@ -428,10 +429,10 @@ def test_a_closed_pr_does_not_block_a_new_push(env, captured_requests, monkeypat
     _seed_canonical(env, jid)
     _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/primary")
     monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
-    ui._write_pr_info(jid, {"url": "https://github.com/w8org/primary/pull/9", "number": 9, "state": "open"})
+    ui._write_pr_info(jid, {"url": "https://github.com/w8org/primary/pull/9", "number": 9, "state": "merged"})
 
     r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
-    assert r.json()["status"] == "existing"
+    assert r.json()["status"] == "existing"  # merged: the document now lives in its repo
 
     ui._write_pr_info(jid, {"url": "https://github.com/w8org/primary/pull/9", "number": 9, "state": "closed"})
     r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
@@ -443,10 +444,10 @@ def test_push_pr_folders_lists_the_design_docs_stps(env, monkeypatch):
     _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests", design_docs="w8org/design-docs")
     ui._stp_folder_cache.clear()
     monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False: None if not anonymous else [
-        {"name": "sig-virt", "type": "dir"}, {"name": "stp-template", "type": "dir"},
+        {"name": "sig-storage", "type": "dir"}, {"name": "stp-template", "type": "dir"},
         {"name": "README.md", "type": "file"}, {"name": "sig-network", "type": "dir"}])
     r = client.get("/api/pipelines/PUSH-8/push-pr/folders")
-    assert r.json() == {"repo": "w8org/design-docs", "folders": ["sig-network", "sig-virt"]}
+    assert r.json() == {"repo": "w8org/design-docs", "folders": ["sig-network", "sig-storage"]}
 
     _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests")
     assert client.get("/api/pipelines/PUSH-8/push-pr/folders").json() == {"repo": None, "folders": []}
@@ -462,7 +463,7 @@ def test_legacy_layout_tests_are_still_pushed(env, captured_requests, monkeypatc
 
     r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
     assert r.status_code == 200, r.text
-    assert f"tests/qualityflow/{jid}/qf_widget.py" in _pushed_paths(captured_requests)
+    assert f"tests/qualityflow/{jid}/test_qf_widget.py" in _pushed_paths(captured_requests)
 
 
 def test_push_pr_never_falls_back_to_the_server_token_when_auth_is_on(env, captured_requests, monkeypatch):
@@ -489,6 +490,42 @@ def test_push_pr_to_a_gitlab_target_is_501_not_a_fake_success(env, captured_requ
     r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
     assert r.status_code == 501, r.text
     assert "GitLab push is not supported" in r.json()["detail"]
+    assert captured_requests == []
+
+
+def test_generated_python_names_match_the_tests_repo_python_files(env, captured_requests, monkeypatch, tmp_path):
+    """A typical tests repo's CI runs `pytest --collect-only` with testpaths =
+    tests and pytest's default python_files. Push to PR sent QF's
+    qf_{feature}.py / qf_test_{feature}.py there unchanged, and pytest collects
+    those only when the file is named on the command line, so that CI never
+    ran them."""
+    # That CI invocation, on a repo shaped like it, decides what is collected:
+    # the configured name must be, and the push guard must agree name for name.
+    prefix = yaml.safe_load((ROOT / "config" / "_defaults.yaml").read_text())["test_file_prefix"]["python"]
+    configured = f"{prefix}widget.py"  # std-generator copies the prefix into every STD
+    names = (configured, "widget_test.py", "qf_widget.py", "qf_test_widget.py")
+    repo = tmp_path / "tests-repo"
+    case_dir = repo / "tests" / "qualityflow" / "PROJ-1"
+    case_dir.mkdir(parents=True)
+    (repo / "pytest.ini").write_text("[pytest]\ntestpaths = tests\n")
+    for i, name in enumerate(names):
+        (case_dir / name).write_text(f"def test_{i}():\n    pass\n")
+    out = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+                         cwd=repo, capture_output=True, text=True, timeout=120).stdout
+    collected = {line.split("::")[0].rsplit("/", 1)[-1] for line in out.splitlines() if "::" in line}
+    assert collected == {configured, "widget_test.py"}, out
+    assert {n for n in names if not ui._pytest_never_collects(n, "def test_0():\n")} == collected
+
+    # Push to PR refuses such a file before any GitHub call; conftest.py passes.
+    jid = "PUSH-9"
+    _seed_canonical(env, jid)
+    (env / jid / "python-tests" / "qf_test_gadget.py").write_text("def test_gadget():\n    pass\n")
+    (env / jid / "python-tests" / "conftest.py").write_text("import pytest\n")
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/primary")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"].startswith("pytest would never collect qf_test_gadget.py:"), r.text
     assert captured_requests == []
 
 
@@ -546,13 +583,13 @@ def test_ui_and_canonical_resolver_agree(tmp_path, monkeypatch):
     import subprocess
     _routing_fixture(tmp_path, monkeypatch)
     # resolve.py reads the REPO's config/, which routes exactly like the fixture
-    # (cnv=CNV, example=MYPROJ; EXAMPLE and ZZZZZ unrouted).
+    # (example=MYPROJ; EXAMPLE and ZZZZZ unrouted).
     monkeypatch.setattr(ui, "CONFIG", ROOT / "config")
     monkeypatch.setattr(ui, "_routing_cache", (0.0, {}))
     env = {**os.environ}
     env.pop("SOURCE_REPO_PATH", None)  # exit 3 = auto-discovery, not a routing hit
 
-    for jira_id in ("CNV-80969", "MYPROJ-5", "EXAMPLE-1", "ZZZZZ-1", "PROJ-1"):
+    for jira_id in ("MYPROJ-5", "EXAMPLE-1", "ZZZZZ-1", "PROJ-1"):
         canonical = subprocess.run(
             [sys.executable, str(ROOT / "skills" / "project-resolver" / "resolve.py"), jira_id],
             capture_output=True, text=True, env=env, cwd=ROOT)
@@ -560,3 +597,245 @@ def test_ui_and_canonical_resolver_agree(tmp_path, monkeypatch):
         assert ours["resolved"] is (canonical.returncode == 0), (
             f"{jira_id}: ui.py resolved={ours['resolved']} but resolve.py "
             f"exited {canonical.returncode}\n{canonical.stderr[:400]}")
+
+
+def test_imported_repos_are_written_in_full(env, monkeypatch):
+    """An imported repo used to get only full_name (+language): no url, org or
+    local_path_env, so no analysis step could find its checkout."""
+    proj = ui.CONFIG / "projects" / "example"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "repositories.yaml").write_text(
+        "primary_repo:\n  full_name: my-org/tests\n  build_command: make test\n")
+    monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False:
+                        {"default_branch": "develop", "language": "Python"})
+    r = client.post("/api/projects/example/import-repos", headers=HDR, json={"repos": [
+        {"url": "https://github.com/my-org/tests", "type": "primary"},
+        {"url": "my-org/design-docs", "type": "design_docs"},
+        "my-org/helper-lib"]})
+    assert r.status_code == 200, r.text
+    cfg = yaml.safe_load((proj / "repositories.yaml").read_text())
+    assert cfg["primary_repo"]["build_command"] == "make test"          # kept
+    assert cfg["primary_repo"]["local_path_env"] == "TESTS_REPO_PATH"
+    assert cfg["design_docs_repo"]["default_branch"] == "develop"
+    lib = cfg["additional_repos"][0]
+    assert lib == {"name": "helper-lib", "org": "my-org", "full_name": "my-org/helper-lib",
+                   "url": "https://github.com/my-org/helper-lib", "local_path_env": "HELPER_LIB_REPO_PATH",
+                   "default_branch": "develop", "language": "python"}
+
+
+# ---------------------------------------------------------------------------
+# Project settings > Repositories: add / replace / remove one repo
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def repos_proj(env, monkeypatch):
+    proj = ui.CONFIG / "projects" / "example"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "repositories.yaml").write_text(
+        "primary_repo:\n  full_name: my-org/tests\n  build_command: make test\n"
+        "additional_repos:\n- full_name: my-org/lib\n  note: keep me\n"
+        "pr_url_patterns:\n- https://github.com/{org}/{repo}/pull/{number}\n")
+    monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False:
+                        {"default_branch": "main", "language": "Go"})
+    return proj / "repositories.yaml"
+
+
+def _add(repo, role):
+    return client.post("/api/projects/example/repos", headers=HDR, json={"repo": repo, "role": role})
+
+
+def test_repo_added_to_each_role(repos_proj):
+    for repo, role in (("https://github.com/my-org/e2e.git", "tier2"),
+                       ("my-org/docs", "design_docs"), ("my-org/product", "additional"),
+                       ("https://github.com/my-org/new-tests/", "primary")):
+        assert _add(repo, role).status_code == 200
+    cfg = yaml.safe_load(repos_proj.read_text())
+    assert cfg["tier2_repo"]["full_name"] == "my-org/e2e"
+    assert cfg["design_docs_repo"]["local_path_env"] == "DOCS_REPO_PATH"
+    assert [r["full_name"] for r in cfg["additional_repos"]] == ["my-org/lib", "my-org/product"]
+    # A different tests repo replaces the slot; its old keys go with it.
+    assert cfg["primary_repo"]["full_name"] == "my-org/new-tests"
+    assert "build_command" not in cfg["primary_repo"] and cfg["primary_repo"]["build_system"] == ""
+    assert cfg["pr_url_patterns"] == ["https://github.com/{org}/{repo}/pull/{number}"]  # rest kept
+
+
+def test_repo_same_slot_keeps_keys_and_context_dedups(repos_proj):
+    _add("my-org/tests", "primary")
+    r = _add("my-org/lib", "additional")
+    cfg = yaml.safe_load(repos_proj.read_text())
+    assert cfg["primary_repo"]["build_command"] == "make test"
+    assert cfg["primary_repo"]["local_path_env"] == "TESTS_REPO_PATH"
+    assert len(cfg["additional_repos"]) == 1
+    assert cfg["additional_repos"][0]["note"] == "keep me"
+    assert cfg["additional_repos"][0]["url"] == "https://github.com/my-org/lib"
+    assert [x["role"] for x in r.json()["repos"]] == ["primary", "additional"]
+
+
+def test_repo_removed(repos_proj):
+    _add("my-org/docs", "design_docs")
+    hdel = lambda body: client.request("DELETE", "/api/projects/example/repos", headers=HDR, json=body)  # noqa: E731
+    assert hdel({"repo": "my-org/lib", "role": "additional"}).status_code == 200
+    assert hdel({"repo": "my-org/docs", "role": "design_docs"}).status_code == 200
+    assert hdel({"repo": "my-org/tests", "role": "primary"}).status_code == 400
+    cfg = yaml.safe_load(repos_proj.read_text())
+    assert cfg["additional_repos"] == [] and "design_docs_repo" not in cfg
+    assert cfg["primary_repo"]["full_name"] == "my-org/tests"
+
+
+@pytest.mark.parametrize("repo,role", [("not-a-repo", "additional"), ("a/b/c", "additional"),
+                                       ("../..", "additional"), ("my-org/x;rm", "additional"),
+                                       ("my-org/x", "owner"), (None, "primary")])
+def test_repo_bad_input_rejected(repos_proj, repo, role):
+    before = repos_proj.read_text()
+    assert _add(repo, role).status_code == 400
+    assert repos_proj.read_text() == before
+
+
+def test_repo_checkout_status(repos_proj, tmp_path, monkeypatch):
+    checkout = tmp_path / "tests-checkout"
+    checkout.mkdir()
+    _add("my-org/tests", "primary")
+    monkeypatch.setenv("TESTS_REPO_PATH", str(checkout))
+    monkeypatch.delenv("LIB_REPO_PATH", raising=False)
+    _add("my-org/lib", "additional")
+    rows = {r["full_name"]: r for r in client.get("/api/projects/example").json()["repos"]}
+    assert rows["my-org/tests"]["checked_out"] and rows["my-org/tests"]["checkout_path"] == str(checkout)
+    assert not rows["my-org/lib"]["checked_out"] and rows["my-org/lib"]["checkout_path"] == ""
+    # A variable that is set but is not a directory is neither trusted nor echoed.
+    monkeypatch.setenv("TESTS_REPO_PATH", "ghp_not_a_path")
+    row = client.get("/api/projects/example").json()["repos"][0]
+    assert row["checked_out"] is False and row["checkout_path"] == ""
+
+
+def test_an_open_pr_is_updated_on_its_own_branch(env, captured_requests, monkeypatch):
+    """A refine or edit after the push lands on the open PR as a new commit on
+    top of its branch (not a force-push from main), keeping the folder."""
+    jid = "PUSH-8"
+    _seed_canonical(env, jid)
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests", design_docs="w8org/design-docs")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR,
+                    json={"github_token": TOKEN, "stp_folder": "sig-x"})
+    assert r.json()["status"] == "created"
+    path = f"stps/sig-x/{jid}.md"
+    assert ui._read_pr_info(jid)["pushed_blobs"][path]
+
+    branch_head = "e" * 40
+    blobs = ui._read_pr_info(jid)["pushed_blobs"]
+    monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False:
+                        {"object": {"sha": branch_head}} if "/git/ref/heads/" in url
+                        else {"sha": blobs.get(urllib.parse.unquote(url.split("/contents/")[1].split("?")[0]), "")})
+    captured_requests.clear()
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "updated"
+    parents = [json.loads(q.data)["parents"] for q in captured_requests
+               if q.full_url.endswith("/git/commits") and q.data]
+    assert [branch_head] in parents, parents
+    assert not any(q.full_url.endswith("/git/refs") for q in captured_requests), "no new branch on update"
+
+
+def test_update_refuses_to_overwrite_a_change_made_on_the_pr(env, captured_requests, monkeypatch):
+    jid = "PUSH-9"
+    _seed_canonical(env, jid)
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests", design_docs="w8org/design-docs")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN, "stp_folder": "sig-x"})
+    monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False:
+                        {"object": {"sha": "e" * 40}} if "/git/ref/heads/" in url else {"sha": "0" * 40})
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
+    assert r.status_code == 409, r.text
+    assert "changed on the PR" in r.json()["detail"]
+
+
+def test_git_blob_sha_matches_git():
+    assert ui._git_blob_sha("hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
+
+
+def test_notes_queue_up_from_several_reviewers(env):
+    jid = "NOTE-1"
+    for who, text in (("Alice", "TS-03 duplicates TS-02"), ("Bob", "Add a negative case for TS-05")):
+        r = client.post(f"/api/pipelines/{jid}/notes/stp", headers=HDR,
+                        json={"text": text, "display_name": who})
+        assert r.status_code == 200, r.text
+    notes = client.get(f"/api/pipelines/{jid}/notes/stp").json()["notes"]
+    assert [(n["who"], n["text"]) for n in notes] == [
+        ("Alice", "TS-03 duplicates TS-02"), ("Bob", "Add a negative case for TS-05")]
+    assert client.post(f"/api/pipelines/{jid}/notes/stp", headers=HDR, json={"text": " "}).status_code == 400
+    assert client.post(f"/api/pipelines/{jid}/notes/codegen", headers=HDR, json={"text": "x"}).status_code == 400
+
+
+def test_pr_comments_become_queued_notes_once(env, monkeypatch):
+    jid = "NOTE-2"
+    ui._write_pr_info(jid, {"url": "https://github.com/o/d/pull/4", "number": 4,
+                            "target_repo": "o/d", "state": "open"})
+    replies = {
+        "/pulls/4/comments": [{"user": {"login": "carol"}, "body": "Wrong gate name", "path": "stps/x.md",
+                               "line": 12, "created_at": "2026-10-01T10:00:00Z", "html_url": "u1"},
+                              {"user": {"login": "ci[bot]"}, "body": "lint ok", "created_at": "2026-10-01T10:00:01Z"}],
+        "/pulls/4/reviews": [{"user": {"login": "dan"}, "body": "Merge TS-03 into TS-02",
+                              "submitted_at": "2026-10-01T11:00:00Z", "state": "CHANGES_REQUESTED"}],
+        "/issues/4/comments": [],
+    }
+    monkeypatch.setattr(ui, "_github_api_get", lambda url, token="", anonymous=False:
+                        next((v for k, v in replies.items() if k in url), []))
+    r = client.post(f"/api/pipelines/{jid}/pull-pr-comments", headers=HDR, json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["pulled"] == 2  # the bot is skipped
+    notes = r.json()["notes"]
+    assert notes[0]["who"] == "@carol" and "stps/x.md:12" in notes[0]["text"]
+    assert client.post(f"/api/pipelines/{jid}/pull-pr-comments", headers=HDR, json={}).json()["pulled"] == 0
+
+
+def test_request_review_validates_and_asks_github(env, captured_requests, monkeypatch):
+    jid = "NOTE-3"
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    ui._write_pr_info(jid, {"url": "https://github.com/o/d/pull/4", "number": 4, "target_repo": "o/d"})
+    assert client.post(f"/api/pipelines/{jid}/request-review", headers=HDR,
+                       json={"reviewers": ["bad login!"], "github_token": TOKEN}).status_code == 400
+    r = client.post(f"/api/pipelines/{jid}/request-review", headers=HDR,
+                    json={"reviewers": ["@alice", "bob"], "github_token": TOKEN})
+    assert r.status_code == 200, r.text
+    sent = [json.loads(q.data) for q in captured_requests if q.full_url.endswith("/requested_reviewers")]
+    assert sent == [{"reviewers": ["alice", "bob"]}]
+
+
+def test_unverified_tests_are_not_pushed_but_the_stp_is(env, captured_requests, monkeypatch):
+    """Tests reach the team's repo only after collecting inside a checkout of it."""
+    jid = "PUSH-10"
+    _seed_canonical(env, jid, phases={**_PHASES, "codegen": {"status": "completed", "verification": "skipped",
+                                                            "verification_reason": "pytest not installed"}})
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests", design_docs="w8org/design-docs")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR,
+                    json={"github_token": TOKEN, "stp_folder": "sig-x"})
+    assert r.status_code == 200, r.text
+    assert "pytest not installed" in r.json()["skipped"]
+    assert _trees_by_repo(captured_requests) == {"w8org/design-docs": [f"stps/sig-x/{jid}.md"]}
+
+
+def test_only_unverified_tests_to_push_is_refused(env, captured_requests, monkeypatch):
+    jid = "PUSH-11"
+    _seed_canonical(env, jid, phases={**_PHASES, "codegen": {"status": "completed", "verification": "failed"}})
+    (env / jid / "stp" / f"{jid}_test_plan.md").unlink()
+    (env / jid / "std" / f"{jid}_test_description.yaml").unlink()
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR, json={"github_token": TOKEN})
+    assert r.status_code == 409 and "did not pass collection" in r.json()["detail"], r.text
+    assert captured_requests == []
+
+
+def test_verified_tests_go_to_their_place_in_the_tests_repo(env, captured_requests, monkeypatch):
+    """Codegen writes inside a checkout of the tests repo and records each
+    file's target_path; the push uses it instead of tests/qualityflow/{ID}/."""
+    jid = "PUSH-12"
+    _seed_canonical(env, jid)
+    (env / jid / "python-tests" / "summary.yaml").write_text(yaml.safe_dump(
+        {"files": [{"name": "test_qf_widget.py", "target_path": "tests/widgets/test_qf_widget.py"}]}))
+    _seed_repos_yaml(ui.CONFIG, "example", primary="w8org/tests", design_docs="w8org/design-docs")
+    monkeypatch.setattr(ui, "_GITHUB_TOKEN", "")
+    r = client.post(f"/api/pipelines/{jid}/push-pr", headers=HDR,
+                    json={"github_token": TOKEN, "stp_folder": "sig-x"})
+    assert r.status_code == 200, r.text
+    assert _trees_by_repo(captured_requests)["w8org/tests"] == ["tests/widgets/test_qf_widget.py"]
