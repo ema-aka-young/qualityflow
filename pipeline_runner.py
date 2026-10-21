@@ -212,8 +212,12 @@ def _validated_adc(adc):
 # except where Anthropic lists otherwise. Vertex bills Claude through Google and
 # may differ, so the Claude CLI's own total_cost_usd always wins when present.
 # Checked 2026-09-27. ponytail: a hand-kept table; an unknown model prices as
-# None (the dashboard then shows tokens only) rather than a guess.
+# None (the dashboard then shows tokens only) rather than a guess. OpenAI rows
+# checked 2026-10-14.
 MODEL_PRICES = {
+    "gpt-6.1-sol": (2.0, 0.1, 2.5, 10.0),
+    "gpt-6-sol": (2.0, 0.2, 2.5, 10.0),
+    "gpt-6-luna": (0.1, 0.01, 0.125, 0.5),
     "gpt-6-astra": (10.0, 1.0, 12.5, 50.0),
     "gpt-5.6-sol": (4.0, 0.4, 5.0, 20.0),
     "gpt-5.6-terra": (2.0, 0.2, 2.5, 12.0),
@@ -1008,6 +1012,160 @@ def push_outputs(jira_id, url, api_key):
     return False
 
 
+# Jira label trigger (`watch`). Dashboard-independent on purpose: any team can
+# run it from cron, CI, a Kubernetes CronJob or the Fullsend runner, with the
+# job's own Jira/GitHub/model credentials in its environment.
+_CLAIM_LABEL = "qf-running"
+
+
+def _trigger_jql(prefixes, label):
+    projects = ", ".join('"%s"' % p for p in sorted(prefixes))
+    return 'project in (%s) AND labels = "%s" ORDER BY created ASC' % (projects, label)
+
+
+def _result_label(phase, verdict, produced):
+    """The label a finished run leaves on its ticket, e.g. qf-stp-approved-with-findings."""
+    if not produced:
+        return "qf-%s-blocked" % phase
+    return "qf-%s-%s" % (phase, (verdict or "done").lower().replace("_", "-"))
+
+
+def _jira(method, path, body=None):
+    """One Jira REST v2 call (works on Cloud and Server/DC) with the job's own
+    credentials. Returns parsed JSON, or None for an empty body."""
+    import base64
+    import ssl
+    import urllib.request
+    base = os.environ["JIRA_URL"].rstrip("/")
+    auth = base64.b64encode(("%s:%s" % (os.environ["JIRA_USERNAME"],
+                                        os.environ["JIRA_API_TOKEN"])).encode()).decode()
+    ctx = ssl.create_default_context()
+    if os.environ.get("QF_JIRA_INSECURE_TLS", "").lower() in ("1", "true", "yes"):
+        ctx.check_hostname = False  # same escape hatch as ui.py, for a self-signed internal Jira
+        ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        base + path, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": "Basic " + auth, "Accept": "application/json",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw else None
+
+
+def _search(jql, limit):
+    import urllib.error
+    import urllib.parse
+    q = urllib.parse.urlencode({"jql": jql, "fields": "summary", "maxResults": limit})
+    try:  # Jira Cloud retired /search for /search/jql; Server/DC only has /search
+        found = _jira("GET", "/rest/api/2/search/jql?" + q)
+    except urllib.error.HTTPError as e:
+        if e.code not in (404, 410):
+            raise
+        found = _jira("GET", "/rest/api/2/search?" + q)
+    return [i["key"] for i in (found or {}).get("issues", [])]
+
+
+def _relabel(key, remove=(), add=()):
+    ops = [{"remove": l} for l in remove] + [{"add": l} for l in add]
+    _jira("PUT", "/rest/api/2/issue/%s" % key, {"update": {"labels": ops}})
+
+
+def _comment(key, text):
+    _jira("POST", "/rest/api/2/issue/%s/comment" % key, {"body": text})
+
+
+def watch(label, limit, phase="stp", model="", push="", api_key="", dry_run=False):
+    """One pass of the label trigger: run `phase` for up to `limit` tickets in
+    the routed Jira projects that carry `label`, then report back on each.
+
+    A ticket is taken off the queue before its run (label -> qf-running) so the
+    next pass skips it, and ends with a result label (qf-stp-approved,
+    qf-stp-needs-revision, qf-stp-imported when the team's own STP was pulled
+    in, qf-stp-blocked, qf-stp-failed) and a comment linking the dashboard's
+    public page for it (QUALITYFLOW_BASE_URL) when results were pushed.
+    Re-adding `label` queues it again. Returns the number of failed runs.
+
+    ponytail: the claim is not atomic, so two passes that overlap can both
+    start the same ticket; schedule passes further apart than a run takes
+    (or give the CI job a concurrency group) until that matters."""
+    import yaml
+    missing = [v for v in ("JIRA_URL", "JIRA_USERNAME", "JIRA_API_TOKEN") if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError("the label trigger needs %s in its environment" % ", ".join(missing))
+    routing = yaml.safe_load((ROOT / "config" / "routing.yaml").read_text()) or {}
+    prefixes = {p for r in routing.get("routes", []) for p in (r.get("jira_prefixes") or [])}
+    if not prefixes:
+        raise RuntimeError("config/routing.yaml routes no Jira projects — nothing to watch")
+    keys = _search(_trigger_jql(prefixes, label), limit)
+    print("%d ticket(s) labelled %s: %s" % (len(keys), label, " ".join(keys) or "-"))
+    if dry_run:
+        return 0
+    os.environ.setdefault("QF_RUNNER", "cli")
+    failed = 0
+    for key in keys:
+        try:  # one ticket's Jira or run error never stops the rest of the pass
+            failed += not _run_ticket(key, label, phase, model, push, api_key)
+        except Exception as e:
+            failed += 1
+            print("%s: %s" % (key, _redact_secrets(str(e))), file=sys.stderr)
+    return failed
+
+
+def _imported_from(key, since):
+    """Where the team's own STP came from when stp-builder imported it this run
+    instead of writing one (it leaves {key}_stp_source.yaml), else None."""
+    import yaml
+    src = _outputs_dir() / key / "stp" / ("%s_stp_source.yaml" % key)
+    if not src.exists() or src.stat().st_mtime < since - 1:  # 1s slack for coarse mtimes
+        return None
+    found = yaml.safe_load(src.read_text()) or {}
+    return found.get("pull_request") or found.get("url") or "the team's design-docs repo"
+
+
+def _results_line(key, pushed):
+    # QUALITYFLOW_BASE_URL is the dashboard's public address; --push may be an
+    # in-cluster one that nobody reading the ticket can open.
+    base = os.environ.get("QUALITYFLOW_BASE_URL", "").rstrip("/")
+    if pushed and base:
+        return "Results: %s/#pipeline/%s" % (base, key)
+    if pushed:
+        return "Results were sent to the team dashboard."
+    return "Results are in outputs/%s/ where the job ran." % key
+
+
+def _run_ticket(key, label, phase, model, push, api_key):
+    import time
+    _relabel(key, remove=[label], add=[_CLAIM_LABEL])
+    started = time.time()
+    try:
+        result = run_phase(model, key, phase)
+    except Exception as e:
+        _relabel(key, remove=[_CLAIM_LABEL], add=["qf-%s-failed" % phase])
+        _comment(key, "QualityFlow could not run %s: %s\n\nAdd the %s label again to retry."
+                 % (_CMD[phase], _redact_secrets(str(e))[:500], label))
+        print("%s: qf-%s-failed" % (key, phase), file=sys.stderr)
+        return False
+    persist_usage(key, phase, result)
+    produced = phase != "stp" or (_outputs_dir() / key / "stp" / ("%s_test_plan.md" % key)).exists()
+    imported = _imported_from(key, started) if phase == "stp" and produced else None
+    result_label = "qf-stp-imported" if imported else _result_label(phase, result.get("verdict"), produced)
+    where = _results_line(key, bool(push) and push_outputs(key, push, api_key))
+    cost = (result.get("usage") or {}).get("cost_usd")
+    run = "model %s%s" % (result.get("model") or "default",
+                          ", $%.2f" % cost if isinstance(cost, (int, float)) else "")
+    _relabel(key, remove=[_CLAIM_LABEL], add=[result_label])
+    if imported:
+        text = ("QualityFlow found this ticket's STP in the team's design docs and imported it "
+                "unchanged: %s\nNo new plan was generated (%s).\n%s" % (imported, run, where))
+    else:
+        text = "QualityFlow ran %s: %s (%s).\n%s" % (
+            _CMD[phase], result.get("verdict") or ("done" if produced else "no output"), run, where)
+    _comment(key, text)
+    print("%s: %s" % (key, result_label))
+    return True
+
+
 def main(argv):
     """CLI entrypoint.
 
@@ -1019,7 +1177,10 @@ def main(argv):
 
     `push <JIRA_ID> [--url URL]` ships an existing outputs/<ticket> tree —
     the path for a ticket that was run interactively with the slash commands.
-    Both read the dashboard key from QUALITYFLOW_API_KEY."""
+    Both read the dashboard key from QUALITYFLOW_API_KEY.
+
+    `watch [--label L] [--max N] [--dry-run]` is one pass of the Jira label
+    trigger (see watch()); schedule it with cron, CI or a CronJob."""
     import argparse
     ap = argparse.ArgumentParser(prog="pipeline_runner.py", description=main.__doc__)
     sub = ap.add_subparsers(dest="op", required=True)
@@ -1035,11 +1196,29 @@ def main(argv):
     q.add_argument("jira_id")
     q.add_argument("--url", default=os.environ.get("QF_DASHBOARD_URL", ""),
                    help="dashboard base URL (default: $QF_DASHBOARD_URL)")
+    w = sub.add_parser("watch", help="one pass of the Jira label trigger: run the STP for "
+                       "labelled tickets and report back on each (schedule it with cron/CI)")
+    w.add_argument("--label", default=os.environ.get("QF_TRIGGER_LABEL", "qf-generate"),
+                   help="the label that queues a ticket (default: $QF_TRIGGER_LABEL or qf-generate)")
+    w.add_argument("--max", type=int, default=int(os.environ.get("QF_TRIGGER_MAX", "2")),
+                   help="tickets started per pass (default: $QF_TRIGGER_MAX or 2)")
+    w.add_argument("--model", default="", help="model override (default: inherit)")
+    w.add_argument("--push", metavar="URL", default=os.environ.get("QF_DASHBOARD_URL", ""),
+                   help="also POST each ticket's outputs to this dashboard (optional)")
+    w.add_argument("--dry-run", action="store_true", help="list the queued tickets; change nothing")
     args = ap.parse_args(argv)
     api_key = os.environ.get("QUALITYFLOW_API_KEY", "")
 
     if args.op == "push":
         sys.exit(0 if push_outputs(args.jira_id, args.url, api_key) else 1)
+    if args.op == "watch":
+        try:
+            failed = watch(args.label, args.max, model=args.model, push=args.push,
+                           api_key=api_key, dry_run=args.dry_run)
+        except Exception as e:  # urllib errors, missing env, bad config: one clear line
+            print("error: %s" % _redact_secrets(str(e)), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(1 if failed else 0)
 
     # Explicitly invoking this CLI *is* the opt-in the QF_RUNNER gate asks for;
     # the gate exists to stop the dashboard running phases on unprovisioned hosts.
@@ -1166,4 +1345,11 @@ if __name__ == "__main__":  # self-check: parser on a fixture, no CLI/network
         os.environ.pop("QF_OUTPUTS_DIR", None)
         if _saved_outputs is not None:
             os.environ["QF_OUTPUTS_DIR"] = _saved_outputs
+    # label trigger: query scope and the labels a run leaves behind
+    assert _trigger_jql({"B", "A"}, "qf-generate") == \
+        'project in ("A", "B") AND labels = "qf-generate" ORDER BY created ASC'
+    assert _result_label("stp", "APPROVED_WITH_FINDINGS", True) == "qf-stp-approved-with-findings"
+    assert _result_label("stp", "NEEDS_REVISION", True) == "qf-stp-needs-revision"
+    assert _result_label("stp", None, True) == "qf-stp-done"
+    assert _result_label("stp", "APPROVED", False) == "qf-stp-blocked"
     print("pipeline_runner self-check passed")
