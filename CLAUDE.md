@@ -235,6 +235,13 @@ check `config_dir` before reading tier config files.
 
 Agents then read only the config files they need from `config_dir`.
 
+An optional `outputs/{JIRA_ID}/repositories.overlay.yaml` scopes repositories
+for a ticket: `only` selects configured types or names, `add` appends entries,
+then `paths` overrides checkouts by repo name. Project resolution returns
+`repositories` and `repositories_file` as the authoritative downstream source;
+the runner scopes checkout environment variables and LSP bridges likewise.
+No overlay preserves existing behavior. See config/README.md for the format.
+
 ### Feature Toggles
 
 | Toggle | Default | Effect when false |
@@ -458,11 +465,17 @@ review has critical or major findings, mirroring the STP chain. Stub files use t
 are written to `outputs/{JIRA_ID}/std/`.
 
 Phase 2 (Implementation): `/generate-tests` fills in working
-test bodies inside a checkout of the team's tests repo, using only the
+test bodies inside a checkout of the team's tests repo, from the product
+interface each scenario drives (read in the product checkout first, from the
+files `repo_context.py product` lists per scenario, and recorded as
+`product_refs`), using only the
 fixtures, helpers and markers that suite really has (never a `conftest.py`
-that redefines one, never faked utilities). It then collects (pytest, via
-`uv run` when the repo has `uv.lock`) or compiles (`go vet`, `go test -run xxx
--count=0`) them there and records `verification: passed|failed|skipped` on the
+that redefines one, never faked utilities, never a test that passes without
+touching the product: a scenario it cannot implement is listed under
+`not_implemented` and its stub stays pending, never a fixture that needs
+`request.param` left unparametrized, never a team's own file listed as output). It then collects (pytest, via
+the checkout's `.venv`, else `uv run` when the repo has `uv.lock`) or compiles
+(`go vet`, `go test -c`, which never runs TestMain) them there and records `verification: passed|failed|skipped` on the
 `codegen` phase. The phase completes either way; anything but `passed` leaves
 it unverified, and the dashboard labels code generation experimental until it
 passes. Collection is the limit of that check: no generated test is run.
@@ -503,3 +516,7 @@ projects). Keep it in sync with the actual configuration:
   `config/README.md`.
 - When adding a new project under `config/projects/`, verify the
   step-by-step guide in `config/README.md` is still accurate.
+### Model policy
+
+`model_policy` in `_defaults.yaml` (opt-in per-tier models, a `max_cost_usd`
+warning per run) is documented in `config/README.md`.

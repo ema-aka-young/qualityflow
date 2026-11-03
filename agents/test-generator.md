@@ -75,7 +75,13 @@ python3 skills/test-generator/repo_context.py context "$CHECKOUT" {target_dir} -
 Invoke the **test-generator** skill with the Jira ID, the checkout and that
 vocabulary. It uses only the fixtures, helpers and markers listed there (or new
 ones the STD defines), never writes a `conftest.py` that redefines a listed
-fixture, and never fakes a suite utility.
+fixture, never fakes a suite utility, and never writes a test that cannot fail:
+a scenario it cannot implement goes under `not_implemented` (a missing-fixture
+reason names what was searched) and its stub stays pending. Before writing it
+reads, in the product checkout, the interface each scenario drives (the files
+`repo_context.py product` lists for it) and records it as `product_refs`; each test
+performs its own scenario's setup, action and checks. A fixture marked
+`needs_indirect_param` is parametrized `indirect=True` as the siblings do.
 
 The skill:
 
@@ -102,11 +108,11 @@ python3 skills/test-generator/repo_context.py verify "$CHECKOUT" <integrated fil
   --repos-yaml <config_dir>/repositories.yaml
 ```
 
-It runs the repo's own tooling inside the checkout: `uv run pytest
---setup-plan -q` (repo has `uv.lock`) or `python -m pytest --setup-plan -q` —
+It runs the repo's own tooling inside the checkout: `pytest --setup-plan -q`
+with the checkout's `.venv` (else `uv run` when the repo has `uv.lock`) —
 collection plus every fixture resolved, with the repo entry's `verify:`
 settings —
-and `go vet` plus `go test -run xxx -count=0` per Go package. Fix failures and
+and `go vet` plus `go test -c` (builds the test binary, never runs TestMain) per Go package. Fix failures and
 re-run, at most 3 attempts. Keep its `verification` (passed, failed or skipped)
 and `reason` for the summary. It collects or compiles; no test runs.
 

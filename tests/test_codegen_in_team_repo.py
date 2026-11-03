@@ -9,6 +9,7 @@ own completion write, and labels code generation experimental until it passes.
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -70,14 +71,14 @@ def test_context_is_the_suites_real_vocabulary(repo):
 
 def test_verify_collects_inside_the_checkout(repo, monkeypatch):
     monkeypatch.setattr(rc, "python_cmd", lambda r: [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
-    write(repo, "tests/api/test_qf_login.py", "def test_new(admin_client, namespace):\n    pass\n")
+    write(repo, "tests/api/test_qf_login.py", "def test_new(admin_client, namespace):\n    assert admin_client\n")
     res = rc.verify(repo, ["tests/api/test_qf_login.py"])
     assert res["verification"] == "passed", res
     assert "no test was run" in res["reason"]
 
     # An unregistered marker under --strict-markers fails, as it would in the team's CI.
     write(repo, "tests/api/test_qf_bad.py", "import pytest\n\n@pytest.mark.qf_test_id('TS-1')\n"
-          "def test_bad():\n    pass\n")
+          "def test_bad(admin_client):\n    assert admin_client\n")
     res = rc.verify(repo, ["tests/api/test_qf_bad.py"])
     assert res["verification"] == "failed", res
 
@@ -91,14 +92,14 @@ def test_verify_resolves_fixtures_and_refuses_uncollected_names(repo, monkeypatc
     can never run. Verified on a real suite (a test copied out of the folder
     whose conftest defines its fixtures failed, in place it passed)."""
     monkeypatch.setattr(rc, "python_cmd", lambda r: [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
-    write(repo, "tests/api/test_qf_ghost.py", "def test_new(admin_client, no_such_fixture):\n    pass\n")
+    write(repo, "tests/api/test_qf_ghost.py", "def test_new(admin_client, no_such_fixture):\n    assert admin_client\n")
     res = rc.verify(repo, ["tests/api/test_qf_ghost.py"])
     assert res["verification"] == "failed" and "fixtures not found: no_such_fixture" in res["reason"], res
     # The repo's CI never collects a file its discovery skips, even though
     # naming it on the command line would.
     write(repo, "tests/api/qf_login.py", "def test_new(admin_client):\n    pass\n")
     res = rc.verify(repo, ["tests/api/qf_login.py"])
-    assert res["verification"] == "failed" and "test_*.py" in res["reason"], res
+    assert res["verification"] == "failed" and "test_qf_*.py" in res["reason"], res
 
 
 def test_verify_applies_the_repos_offline_ci_settings(repo, tmp_path_factory, monkeypatch):
@@ -111,7 +112,7 @@ def test_verify_applies_the_repos_offline_ci_settings(repo, tmp_path_factory, mo
           '@pytest.fixture\ndef admin_client():\n    return "root"\n'
           '@pytest.fixture\ndef namespace():\n    return "ns"\n'
           'def pytest_addoption(parser):\n    parser.addoption("--qf-cfg")\n')
-    write(repo, "tests/api/test_qf_login.py", "def test_new(admin_client, namespace):\n    pass\n")
+    write(repo, "tests/api/test_qf_login.py", "def test_new(admin_client, namespace):\n    assert admin_client\n")
     res = rc.verify(repo, ["tests/api/test_qf_login.py"])
     assert res["verification"] == "failed" and "verify: {env, args}" in res["reason"], res
     cfg = tmp_path_factory.mktemp("cfg") / "repositories.yaml"
@@ -124,10 +125,181 @@ def test_verify_applies_the_repos_offline_ci_settings(repo, tmp_path_factory, mo
     assert rc.repo_settings(None, "primary_repo") == ({}, [])
 
 
-def test_python_cmd_uses_uv_when_the_repo_is_uv_managed(tmp_path):
+def test_python_cmd_prefers_the_checkouts_venv_over_uv(tmp_path):
     assert rc.python_cmd(tmp_path)[1:] == ["-m", "pytest"]
     (tmp_path / "uv.lock").write_text("")
     assert rc.python_cmd(tmp_path) == ["uv", "run", "pytest"]
+    write(tmp_path, ".venv/bin/python", "")
+    assert rc.python_cmd(tmp_path) == [str(tmp_path / ".venv/bin/python"), "-m", "pytest"]
+
+
+HOLLOW = """import pytest
+
+from tests.suite.constant import HEALTH
+
+_IDS = {"TS-1": "x"}
+
+
+def _contract(tid):
+    assert tid in _IDS
+    assert HEALTH == "/health"
+
+
+def test_only_constants():
+    _contract("TS-1")
+
+
+class TestIds:
+    def test_only_its_own_id(self):
+        assert "TS-1".startswith("TS-")
+
+    @pytest.mark.parametrize("tid", ["TS-1", "TS-2"])
+    def test_parametrize_is_not_a_fixture(self, tid):
+        assert tid
+
+
+def test_placeholder(client):
+    pytest.fail("not implemented")
+
+
+def test_asserts_nothing(client):
+    assert True
+
+
+def test_skipped_placeholder(client):
+    client.get("/health")
+    pytest.skip("needs a cluster")
+"""
+
+REAL = """import pytest
+
+from product.api import create
+from tests.suite import helpers
+
+
+def _make(name):
+    return create(name)
+
+
+def test_through_a_helper():
+    assert _make("a").name == "a"
+
+
+def test_fixture(client):
+    assert client.get("/health").status_code == 200
+
+
+def test_conditional_skip_is_fine(client):
+    if not client.ready:
+        pytest.skip("no cluster")
+    assert client.get("/health").status_code == 200
+
+
+@pytest.mark.usefixtures("cluster")
+class TestWithClassFixtures:
+    def test_suite_helper(self):
+        assert helpers.wait_ready() is None
+
+
+@pytest.mark.parametrize("ns", [{"name": "x"}], indirect=True)
+def test_indirect_parametrize_is_a_fixture(ns):
+    assert ns
+"""
+
+
+def test_hollow_tests_are_named_with_the_reason(tmp_path):
+    write(tmp_path, "tests/test_qf_hollow.py", HOLLOW)
+    found = rc.hollow_tests(tmp_path / "tests/test_qf_hollow.py", "tests/test_qf_hollow.py")
+    assert [h.split("::")[1].split(" ")[0] for h in found] == [
+        "test_only_constants", "test_placeholder", "test_asserts_nothing", "test_skipped_placeholder",
+        "test_only_its_own_id", "test_parametrize_is_not_a_fixture"]
+    assert "test_placeholder (fails unconditionally)" in " ".join(found)
+    assert "test_skipped_placeholder (skips unconditionally)" in " ".join(found)
+    write(tmp_path, "tests/test_qf_real.py", REAL)
+    assert rc.hollow_tests(tmp_path / "tests/test_qf_real.py", "tests/test_qf_real.py") == []
+
+
+def test_verify_fails_hollow_tests_before_running_pytest(tmp_path, monkeypatch):
+    monkeypatch.setattr(rc, "python_cmd", lambda r: ["qf-no-such-tool"])
+    write(tmp_path, "tests/test_qf_hollow.py", HOLLOW)
+    res = rc.verify(tmp_path, ["tests/test_qf_hollow.py"])
+    assert res["verification"] == "failed" and res["reason"].startswith("6 test(s) never touch the product")
+
+
+PARAM_CONFTEST = """import pytest
+
+
+@pytest.fixture
+def ns(request, client):
+    return request.param["name"]
+
+
+@pytest.fixture
+def server(ns):
+    return ns
+
+
+@pytest.fixture(params=["a"])
+def own_params(request):
+    return request.param
+
+
+@pytest.fixture
+def client():
+    return 1
+"""
+
+
+def test_vocabulary_marks_fixtures_that_need_an_indirect_parametrize(tmp_path):
+    """--setup-plan never runs a fixture body, so a fixture that reads
+    request.param resolves fine and errors on every real run unless the test
+    parametrizes it (42 of 119 luna tests on opendatahub-tests)."""
+    write(tmp_path, "conftest.py", PARAM_CONFTEST)
+    fx = {f["name"]: f for f in rc.python_context(tmp_path, tmp_path / "tests")["fixtures"]}
+    assert fx["ns"]["needs_indirect_param"] == ["ns"]
+    assert fx["server"]["needs_indirect_param"] == ["ns"]  # through the fixture it depends on
+    assert "needs_indirect_param" not in fx["own_params"] and "needs_indirect_param" not in fx["client"]
+
+
+def test_verify_fails_tests_that_would_error_at_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(rc, "python_cmd", lambda r: ["qf-no-such-tool"])
+    write(tmp_path, "conftest.py", PARAM_CONFTEST)
+    write(tmp_path, "tests/test_qf_server.py", """import pytest
+
+
+def test_bare(server):
+    assert server
+
+
+@pytest.mark.parametrize("ns", [{"name": "x"}], indirect=True)
+def test_parametrized(server):
+    assert server
+
+
+@pytest.mark.parametrize("ns", [{"name": "x"}], indirect=True)
+class TestOnTheClass:
+    def test_inherits(self, server):
+        assert server
+""")
+    res = rc.verify(tmp_path, ["tests/test_qf_server.py"])
+    assert res["verification"] == "failed" and res["reason"].startswith("1 test(s) would error at setup"), res
+    assert res["output"] == "tests/test_qf_server.py::test_bare (parametrize ns with indirect=True, as the sibling tests do)"
+
+
+def test_verify_refuses_the_teams_own_files(repo):
+    """A run listed the team's existing tests as its output, unchanged."""
+    res = rc.verify(repo, ["tests/api/test_login.py"])
+    assert res["verification"] == "failed" and res["reason"].startswith("not QualityFlow files"), res
+    assert res["reason"].endswith("tests/api/test_login.py")
+    # A conftest.py the run added is ours; one the repo tracks is not.
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(git + ["add", "tests/api/conftest.py"], cwd=repo, check=True)
+    subprocess.run(git + ["commit", "-qm", "suite"], cwd=repo, check=True)
+    write(repo, "tests/new/conftest.py", "")
+    subprocess.run(git + ["add", "tests/new/conftest.py"], cwd=repo, check=True)  # staged is still new
+    res = rc.verify(repo, ["tests/api/conftest.py", "tests/new/conftest.py"])
+    assert res["reason"].endswith(": tests/api/conftest.py"), res
 
 
 @pytest.mark.skipif(not shutil.which("go"), reason="go toolchain not installed")
@@ -139,6 +311,20 @@ def test_verify_compiles_go(tmp_path):
     assert rc.verify(tmp_path, ["pkg/a/qf_one_test.go"])["verification"] == "passed"
     write(tmp_path, "pkg/a/qf_two_test.go", 'package a\n\nimport "testing"\n\nfunc TestTwo(t *testing.T) { Two() }\n')
     assert rc.verify(tmp_path, ["pkg/a/qf_two_test.go"])["verification"] == "failed"
+
+
+@pytest.mark.skipif(not shutil.which("go"), reason="go toolchain not installed")
+def test_verify_go_never_runs_testmain(tmp_path):
+    """A suite's TestMain that starts envtest or a database must not run: compile only."""
+    write(tmp_path, "go.mod", "module example.com/x\n\ngo 1.21\n")
+    write(tmp_path, "pkg/a/a.go", "package a\n\nfunc One() int { return 1 }\n")
+    write(tmp_path, "pkg/a/main_test.go", 'package a\n\nimport (\n\t"os"\n\t"testing"\n)\n\n'
+          'func TestMain(m *testing.M) { os.Exit(3) }\n')
+    write(tmp_path, "pkg/a/qf_one_test.go", 'package a\n\nimport "testing"\n\n'
+          'func TestOne(t *testing.T) { if One() != 1 { t.Fatal("x") } }\n')
+    res = rc.verify(tmp_path, ["pkg/a/qf_one_test.go"])
+    assert res["verification"] == "passed", res
+    assert not list(tmp_path.rglob("*.test"))
 
 
 def test_dashboard_completion_keeps_the_clis_verification():
@@ -168,3 +354,27 @@ def test_dashboard_shows_verification_and_experimental_label():
                    "escapeHtml('verification: ' + phase.verification)",
                    "nextPhase === 'codegen' && codegenExperimentalChip(phases)"):
         assert needle in html, needle
+
+
+def test_product_search_lists_the_interface_files_per_scenario(tmp_path):
+    prod, suite = tmp_path / "product", tmp_path / "suite"
+    write(prod, "api/tenant_types.go", "package v1\n\nconst Kind = \"Tenant\"\n\nconst DefaultName = \"default-tenant\"\n")
+    write(prod, "ctrl/gateway.go", "// gateway not found: activation blocked\nfunc reconcileGateway() {}\n")
+    write(prod, "README.md", "Tenant default-tenant gateway activation\n")
+    subprocess.run(["git", "init", "-q", str(prod)], check=True)
+    subprocess.run(["git", "-C", str(prod), "add", "."], check=True)
+    write(suite, "tests/tenancy/utils.py", "def aitenant_from_spec(name='default-tenant'):\n    return name\n")
+    std = {"source_constants": [
+               {"name": "TenantKind", "value": "Tenant", "source_file": "api/tenant_types.go", "line": 2},
+               {"name": "Gone", "value": "no-such-value", "source_file": "api/old.go", "line": 9}],
+           "scenarios": [{"test_id": "TS-1", "test_objective": {"title": "Verify missing gateway blocks activation"},
+                          "test_data": {"parameters": {
+                              "name": {"value": "default-tenant", "source_constant_ref": "TenantKind"},
+                              "contract": "<TBD: released API>"}}}]}
+    out = rc.product_refs(std, [prod.resolve(), suite.resolve()])
+    assert out["constants"][0]["now"] == "api/tenant_types.go:3"
+    assert out["constants"][1]["now"] == "not found in product"
+    sc = out["scenarios"]["TS-1"]
+    assert "verify" not in sc["terms"] and "gateway" in sc["terms"] and not any("TBD" in t for t in sc["terms"])
+    assert [f.split(":")[0] for f in sc["product"]] == ["api/tenant_types.go", "ctrl/gateway.go"]  # docs skipped
+    assert sc["suite"] == ["tests/tenancy/utils.py:1 (Tenant, default-tenant)"]  # no git: plain grep

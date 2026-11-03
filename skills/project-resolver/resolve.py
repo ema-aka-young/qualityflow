@@ -29,6 +29,7 @@ CONFIG_DIR = REPO_ROOT / "config"
 # Reuse the shared validators from config/validate.py
 sys.path.insert(0, str(CONFIG_DIR))
 import validate as config_validate  # noqa: E402
+from model_policy import merge_policy  # noqa: E402
 
 
 def fail(msg: str, code: int = 1):
@@ -140,6 +141,7 @@ def main():
         "issue_source": parsed["type"],
         "config_dir": f"config/projects/{project_id}",
         "feature_toggles": toggles,
+        "model_policy": merge_policy(defaults, project),
         "stp_header": (project.get("stp_document") or {}).get("header", "Test Plan"),
         "versioning": {
             "product_name": versioning.get("product_name", project.get("display_name", project_id)),
@@ -149,10 +151,23 @@ def main():
         # Auto mode: the tiers scenarios are labelled with instead of test
         # types (empty = test-type labels). See stp-generator Step 4.
         "scenario_tiers": project.get("scenario_tiers") or [],
+        # pytest marks every Python STD stub carries as a decorator, e.g. [manual].
+        "stub_marks": project.get("stub_marks") or [],
         # Populated by the caller when feature_toggles.repo_files_fetch is true
         # (MCP fetch step in SKILL.md — not reachable from this script).
         "repo_rules": {},
     }
+    overlay = REPO_ROOT / "outputs" / context["jira_id"] / "repositories.overlay.yaml"
+    if overlay.exists():
+        from repository_overlay import apply_overlay
+        try:
+            context["repositories"] = apply_overlay(
+                config_validate.load_yaml(project_dir / "repositories.yaml"), overlay)
+        except (ValueError, yaml.YAMLError) as exc:
+            fail(str(exc))
+        resolved = overlay.with_name("repositories.resolved.yaml")
+        resolved.write_text(yaml.safe_dump(context["repositories"], sort_keys=False))
+        context["repositories_file"] = str(resolved)
     if parsed["type"] == "github":
         context["github_issue"] = {
             "owner": parsed["owner"],

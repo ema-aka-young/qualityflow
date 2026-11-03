@@ -176,6 +176,16 @@ scenario_tiers:
     marker: "tier3"
 ```
 
+**stub_marks** (optional) -- pytest marks every Python STD stub carries as a
+real decorator, for a tests repo that marks its not-yet-automated (docstring-only)
+tests, e.g. `@pytest.mark.manual`. The tests repo must register each mark (a stub
+module is imported at collection, so an unregistered mark fails under
+`--strict-markers`). `/generate-tests` leaves them off the implemented test.
+
+```yaml
+stub_marks: [manual]
+```
+
 **stakeholders** (optional) -- People every STP of this project lists for
 review and sign-off, beside the ones from Jira (assignee, QA contact, reporter,
 watchers, component leads) and the design-docs repo's CODEOWNERS. stp-generator
@@ -254,6 +264,38 @@ scope_boundaries:
       - level: "Project"
         description: "Features owned and maintained by this team"
 ```
+
+
+### Per-ticket repository overlay
+
+Create `outputs/PROJ-12345/repositories.overlay.yaml` to scope one ticket.
+`outputs/` is gitignored; shared config and environment variables are unchanged.
+
+```yaml
+only: [primary]                 # configured repo types or repository names
+add:                           # appended after filtering, same entry shape
+  - name: my-fork
+    org: my-org
+    full_name: my-org/my-fork
+    url: https://github.com/my-org/my-fork
+    local_path_env: MY_FORK_REPO_PATH
+    default_branch: main
+paths:                         # repository name -> local checkout
+  my-fork: /tmp/my-fork
+```
+
+All keys are optional. `only` accepts `primary`, `tier2`, `design_docs`,
+`additional`, their config keys, or exact repo names; an empty list excludes
+all configured repos. `add` appends to `additional_repos` after filtering.
+`paths` applies last to retained/added repos, taking precedence over their
+`local_path_env`; relative paths are relative to the run's working directory.
+Without an overlay, behavior is unchanged.
+
+Project resolution returns the authoritative `project_context.repositories`
+and a ticket-local `repositories.resolved.yaml` filename for downstream tools.
+Analysis, repo-file fetching and generation use only that list. The pipeline
+runner restricts checkout environment variables and LSP bridges to the same
+list for this run, without changing the parent process environment.
 
 ### repositories.yaml
 
@@ -714,3 +756,20 @@ values, so they never land on the shared branch.
 
 `migrate.py init RUN --profile FILE` takes the path; nothing reads this folder
 by name.
+
+### Model policy
+
+`model_policy` in `_defaults.yaml` holds three opt-in tiers, each a map of
+runtime (`claude`, `codex`, `cursor`) to a model id, plus `max_cost_usd`. The
+tiers ship empty, so every run keeps its runtime's default model until a
+project sets them in `project.yaml`, e.g.
+`model_policy: {review: {claude: opus}, cheap: {claude: haiku}}`. Use model ids
+your host can reach.
+
+- `standard`: generation and refinement runs; `review`: `stp_review` and
+  `std_review` only; `cheap`: collection and formatting subagents, when the
+  runtime can pick a subagent's model (otherwise they inherit).
+- An explicit model (the dashboard picker, `--model`, or `QF_RUNNER_MODEL` /
+  `QF_RUNNER_CODEX_MODEL` / `QF_RUNNER_CURSOR_MODEL`) always wins.
+- `max_cost_usd` (default 5; `null` disables): a completed runner phase whose
+  recorded cost is above it gets a warning in its output. It never stops a run.

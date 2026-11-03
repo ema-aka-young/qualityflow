@@ -6,7 +6,17 @@ model: inherit
 
 # Regression Analyzer Subagent
 
-**Model:** sonnet
+**Ticket repository scope:** When `project_context.repositories` is present, it
+is the complete repository configuration for this ticket. Use it instead of
+reading shared `repositories.yaml`; pass `project_context.repositories_file`
+to tools requiring a YAML filename. Prefer each entry's `local_path` over its
+`local_path_env` variable. Search, fetch, clone and trace only entries in this
+resolved configuration; a removed slot is unavailable (do not fall back to
+shared config or another checkout). This applies to every example below.
+Without that context field, keep the existing repository lookup behavior.
+
+
+**Model:** project_context.model_policy (explicit user choice takes precedence)
 **Phase:** Pre-Processing
 **Purpose:** Perform LSP-based regression impact analysis
 
@@ -352,6 +362,38 @@ for every ticket, whatever the language, and merge it with 3.5:
    `found_by: text_search`, `symbol` set to the term that found it, `file: null`
    and `behavior_tested` naming what its assertion checks; a test already found
    by 3.5 is listed once. Set `existing_coverage_check: ran`.
+5. **Optional coverage detail** (also applies to tests found by 3.5): add the
+   following fields on the individual `tests[]` entry when assessed. Existing
+   entries without these fields remain valid.
+   - `coverage_depth`: a mapping with `level: full|partial` and `summary`, a
+     one-line "verifies X, Y" description grounded in the test's assertions.
+     Use `full` only when all required behaviour and environmental checks are
+     covered within the project's trust boundary; otherwise use `partial`
+     and identify the remaining gap. A symbol reference alone is not full coverage.
+   - `upstream_ref`: a PR/issue reference explicitly associated with this test
+     in its docstring or surrounding comments (e.g. `my-org/my-repo#123` or
+     `PROJ-12345`). If absent and a checkout is available, inspect the test
+     file's local git history (`git log --follow -- <test_file>` and the
+     relevant commit diff) for a reference tied to this test's introduction
+     or change. A reference to an unrelated test in the same file is not evidence.
+     Omit when unknown or history is unavailable; never guess a reference or
+     infer one from the current ticket. No remote lookup is needed.
+   - `downstream_required`: the string `"no"` only for full coverage as defined
+     above; `"yes"` otherwise. Quote these values in YAML to keep them strings.
+
+   Example assessed test entry (the three new fields are optional):
+
+   ```yaml
+   test_function: test_export_rejects_unknown_format
+   test_file: tests/export/test_export.py
+   line: 88
+   behavior_tested: "Export with an unknown format is rejected with an error"
+   coverage_depth:
+     level: partial
+     summary: "verifies format rejection; environment checks remain uncovered"
+   upstream_ref: my-org/my-repo#123
+   downstream_required: "yes"
+   ```
 
 ### Step 4: Map to Features
 
