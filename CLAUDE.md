@@ -42,8 +42,8 @@ GitHub Actions workflows in `.github/workflows/validate.yml`:
 
 Config validation can also be run locally:
 ```bash
-python config/validate.py config/                    # Validate all projects
-python config/validate.py config/projects/example/   # Validate one project
+uv run config/validate.py config/                    # Validate all projects
+uv run config/validate.py config/projects/example/   # Validate one project
 ```
 
 ## Architecture
@@ -135,7 +135,7 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
     commits to the QualityFlow repo. The dashboard's Push to PR does the same,
     and updates an open PR in place (refusing to overwrite edits made on it)
 
-python3 pipeline_runner.py watch [--label qf-generate] [--max 2] [--dry-run]
+uv run pipeline_runner.py watch [--label qf-generate] [--max 2] [--dry-run]
   → the Jira label trigger, dashboard-independent: one pass runs the STP for
     labelled tickets in the routed Jira projects, then labels and comments on
     each (qf-running while it runs, then qf-stp-<verdict>|imported|blocked|failed).
@@ -343,6 +343,10 @@ this to tag requirements with `coverage_status` (Section III carries
 
 When `coverage_status` is absent, treat it as `NEW` (backward compatible).
 
+An EXISTING/PARTIAL_COVERAGE claim names its test in `covered_by`; `validate_std.py`
+fails a claim whose test is not in the checkouts (`coverage.claims_exist`), so a
+scenario is never skipped on the strength of a test that does not exist.
+
 **Measured coverage overrides this.** The table above is driven by static
 analysis: a symbol counts as covered because a test function *references* it.
 When the pipeline runs on a pull request, the **pr-analyzer** skill measures
@@ -473,7 +477,7 @@ fixtures, helpers and markers that suite really has (never a `conftest.py`
 that redefines one, never faked utilities, never a test that passes without
 touching the product: a scenario it cannot implement is listed under
 `not_implemented` and its stub stays pending, never a fixture that needs
-`request.param` left unparametrized, never a team's own file listed as output). It then collects (pytest, via
+`request.param` left unparametrized, never a team's test class imported, never a team's own file listed as output). It then collects (pytest, via
 the checkout's `.venv`, else `uv run` when the repo has `uv.lock`) or compiles
 (`go vet`, `go test -c`, which never runs TestMain) them there and records `verification: passed|failed|skipped` on the
 `codegen` phase. The phase completes either way; anything but `passed` leaves

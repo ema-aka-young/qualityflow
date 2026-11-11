@@ -81,7 +81,8 @@ reason names what was searched) and its stub stays pending. Before writing it
 reads, in the product checkout, the interface each scenario drives (the files
 `repo_context.py product` lists for it) and records it as `product_refs`; each test
 performs its own scenario's setup, action and checks. A fixture marked
-`needs_indirect_param` is parametrized `indirect=True` as the siblings do.
+`needs_indirect_param` is parametrized `indirect=True` as the siblings do, and
+it never imports the team's test classes or functions (pytest would run them twice).
 
 The skill:
 
@@ -105,8 +106,12 @@ Then integrate each test into the target repo's existing test suite:
 
 ```bash
 python3 skills/test-generator/repo_context.py verify "$CHECKOUT" <integrated files, repo-relative> \
-  --repos-yaml <config_dir>/repositories.yaml
+  --repos-yaml <config_dir>/repositories.yaml \
+  --summary <summary.yaml> --product "$SOURCE_REPO_PATH"
 ```
+
+Every `product_refs` `file:line` must exist in a checkout; code only an open PR
+has goes under `not_implemented`.
 
 It runs the repo's own tooling inside the checkout: `pytest --setup-plan -q`
 with the checkout's `.venv` (else `uv run` when the repo has `uv.lock`) —

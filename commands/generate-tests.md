@@ -228,8 +228,14 @@ written there:
 
 ```bash
 python3 skills/test-generator/repo_context.py verify "$CHECKOUT" {target_path} ... \
-  --repos-yaml {project_context.config_dir}/repositories.yaml
+  --repos-yaml {project_context.config_dir}/repositories.yaml \
+  --summary outputs/{JIRA_ID}/{language}-tests/summary.yaml --product "$SOURCE_REPO_PATH"
 ```
+
+- Every `product_refs` `file:line` must exist in a checkout (the product's, or
+  the tests repo's). A plan made while the feature PR was open cites code the
+  checked-out commit may not have: test only what the checkout has, and list
+  the rest under `not_implemented` with that reason.
 
 - Python: `pytest --setup-plan -q <files>` with the repo's `.venv` when it has
   one, else `uv run pytest` when the repo has `uv.lock`, else `python -m pytest`
@@ -250,6 +256,10 @@ python3 skills/test-generator/repo_context.py verify "$CHECKOUT" {target_path} .
   parametrizing those fixtures `indirect=True` (on the test, its class or
   `pytestmark`) fails: `--setup-plan` never runs a fixture body, so it would
   collect and then error at setup on every real run.
+- Python, also: a file that imports a `Test*` class or `test*` function from
+  one of the team's test modules (`test_*.py` / `*_test.py`) fails: pytest
+  collects imported tests, so the team's tests would run again under it.
+  Import helpers from the suite's utils instead.
 - Every listed file must be QualityFlow's: `test_qf_*.py`, `qf_*_test.go`, or a
   `conftest.py` the checked-out commit does not have. A team's own test listed
   as output fails the check.
