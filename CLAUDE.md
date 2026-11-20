@@ -106,7 +106,10 @@ Resources are deployed to `.claude/` and/or `.cursor/` directories. The `config/
 /approve {JIRA_ID} stp|std [--reject]
   → records a person's decision on the reviewed STP or STD in
     outputs/{JIRA_ID}/state/approvals.yaml (as the dashboard's Approve does);
-    /std-builder waits for the STP's, /generate-tests for the STD's
+    /std-builder waits for the STP's, /generate-tests for the STD's. The
+    dashboard's Un-approve takes a decision back: the document returns to
+    awaiting approval, and what was built from it (STD, tests) is archived
+    to .previous-<ts> once the person confirms
 
 /refine-stp {JIRA_ID} --address-findings  (and /refine-std)
   → fixes MAJOR findings + reviewer notes from
@@ -142,6 +145,18 @@ uv run pipeline_runner.py watch [--label qf-generate] [--max 2] [--dry-run]
     Any scheduler runs it (cron, CI, CronJob, Fullsend) with the job's own
     Jira/GitHub/model credentials from its environment
 
+uv run pipeline_runner.py review-loop [--label qf-autofix] [--max 2] [--dry-run]
+  → the PR review loop, dashboard-independent: one pass takes the review
+    comments the repo's owner, members and collaborators left since the last
+    pull on QualityFlow's open STP PRs
+    (outputs/*/state/pr_info.yaml, branch qualityflow/<ticket>), queues them as
+    reviewer notes, runs /refine-stp --address-findings, commits the changed
+    documents on the same PR branch and posts one summary comment. Off unless
+    the team's pr_autofix toggle is true AND a person labelled the PR
+    qf-autofix. Never force-pushes, merges, closes or relabels; skips a PR
+    whose branch head is not a QualityFlow commit. Schedule it like watch,
+    where outputs/ lives, with GH_TOKEN and the model runtime's credentials
+
 /fix-pr {PR_URL} [--dry-run] [--review-id=ID]
   → Fixes STP/STD documents in a PR based on review comments
   → Posts fix summary comment on PR
@@ -162,7 +177,7 @@ The **stp-orchestrator** agent coordinates this pipeline. In code generation, `/
 
 Not every agent is reached from a command. This repo is a Claude Code plugin (`.claude-plugin/plugin.json`), and `deploy.py` also copies `agents/*.md` to `{base}/agents/`; either way every file in `agents/` is registered as an invocable subagent type. So `qualityflow`, `stp-builder`, `std-builder`, `stp-refiner`, `std-refiner`, `stp-reviewer`, `std-reviewer`, `test-generator`, `ticket-context-analyzer`, `pr-fix-agent`, and `polarion-triager` are **direct entry points** — invoked by name (or picked by the agent selector), not referenced from `commands/*.md`. An `agents/*.md` file with no inbound `.md` reference is therefore not dead code; do not treat the absence of one as evidence it can be deleted.
 
-The **PR fix loop** processes review comments on PRs containing STP/STD documents: it classifies comments (via **comment-classifier**), auto-fixes what it can using existing skills, and flags the rest for human input. It runs when a human invokes `/fix-pr {PR_URL}` — `commands/fix-pr.md` does this work inline — or when the **pr-fix-agent** subagent is invoked directly. No workflow in `.github/workflows/` dispatches either path; there is no `pull_request_review.submitted` trigger in this repo.
+The **PR fix loop** processes review comments on PRs containing STP/STD documents: it classifies comments (via **comment-classifier**), auto-fixes what it can using existing skills, and flags the rest for human input. It runs when a human invokes `/fix-pr {PR_URL}` — `commands/fix-pr.md` does this work inline — or when the **pr-fix-agent** subagent is invoked directly. The automatic path is `uv run pipeline_runner.py review-loop`, run by the team's own scheduler (cron, a CI schedule, a CronJob, Fullsend): it does what a person does on the dashboard (Pull PR comments, Request changes, Push to PR) for new human comments on a PR the team opted in (`pr_autofix` toggle plus the `qf-autofix` label on the PR), sharing that code through `qf_pr.py`. No workflow in `.github/workflows/` runs either path; there is no `pull_request_review.submitted` trigger in this repo.
 
 ### Skills
 
@@ -200,10 +215,12 @@ config/
   _schema.yaml                    # Validation rules
   _defaults.yaml                  # Shared defaults (all projects inherit)
   routing.yaml                    # Issue source → project routing (Jira prefixes + GitHub repos)
+  layers.py, merge.py             # Repo config layers (.qualityflow/): discovery, trust boundary, deep merge
   projects/
     example/                      # Example project skeleton (copy for your project)
       project.yaml               # Identity, toggles, scope boundaries
-      repositories.yaml          # Repos, orgs, build system
+      repositories.yaml          # Repos, orgs, build system, config_sources
+      .qualityflow.example/      # Starter .qualityflow/ for a team's own repo
       components.yaml            # Component → package mappings
       jira.yaml                  # Jira instance config
       environment.yaml           # Platform requirements
@@ -223,8 +240,9 @@ Every command invokes the **project-resolver** skill as Step 0:
 3. For GitHub: extract `owner/repo` (e.g., `my-org/my-repo` from URL or short form) → match against `routes[].github_repos`
 4. Read `config/routing.yaml` → resolve to project (e.g., `example`)
 5. Load `config/_defaults.yaml` + `config/projects/example/project.yaml`
-6. Merge feature toggles (project overrides defaults)
-7. Return `project_context` with `config_dir`, `feature_toggles`, `issue_source`, identity
+6. Merge the repo config layers (`.qualityflow/` in the repo checkouts) over the project dir
+7. Merge feature toggles (project overrides defaults)
+8. Return `project_context` with `config_dir`, `feature_toggles`, `issue_source`, identity
 
 **Auto-discovery fallback:** When routing lookup fails and
 `SOURCE_REPO_PATH` is set, the project-resolver scans the target repo
@@ -241,6 +259,30 @@ then `paths` overrides checkouts by repo name. Project resolution returns
 `repositories` and `repositories_file` as the authoritative downstream source;
 the runner scopes checkout environment variables and LSP bridges likewise.
 No overlay preserves existing behavior. See config/README.md for the format.
+
+**Repo config layers.** A `.qualityflow/` directory in a configured repo's
+local checkout, at its root or in a child directory, holds config for the code
+there and is read automatically (`config/layers.py`, `config/merge.py`).
+Precedence, highest first: the ticket overlay, `.qualityflow/` dirs above the
+run's target (deepest first; `resolve.py --target`, passed by `/stp-builder`,
+`/generate-tests` and `/fix-pr`), the target repo's root, the other repo roots
+in `repositories.yaml` `config_sources.order`, `config/projects/<project>/`,
+`_defaults.yaml`. Mappings deep-merge, lists replace unless their items carry
+`id`/`name`, `null` removes a key. A checkout is untrusted: a layer needs the
+identity marker (`version: 1` + the routed `project_id`, else it is skipped),
+may hold only the files and `project.yaml` keys `_schema.yaml` `config_layers`
+allows (anything else, or an unknown key, is an error), and can turn
+`pii_sanitization`, `repo_files_fetch`, `stp_review`, `std_review` on but never
+off (`pr_autofix` is central-only). When a layer applies, `config_dir` is the
+merged copy `outputs/{JIRA_ID}/config/<project>/`, the context gains
+`config_layers`, `config_provenance` and `config_hash`, and
+`outputs/{JIRA_ID}/config.resolved.yaml` records them (the dashboard's ticket
+view shows them); with no `.qualityflow/` the context is unchanged. In
+auto-discovery the `SOURCE_REPO_PATH` layers' `project.yaml` applies, printed
+as `repo_layer` with exit code 3. Lint a repo's
+layers with `uv run config/validate.py --repo <checkout>`; scaffold one with
+`uv run onboard.py --scaffold-repo <checkout> --project-id <id>`. See
+config/README.md "Repo config layers".
 
 ### Feature Toggles
 
@@ -259,6 +301,7 @@ No overlay preserves existing behavior. See config/README.md for the format.
 | `pii_sanitization` | true | Skip pii-sanitizer invocation in document-formatter |
 | `repo_files_fetch` | true | Skip project-resolver's repo-file fetch step, so `repo_rules` stays empty and the STP/STD reviewers fall back to generic default rules (lower review confidence) |
 | `polarion_lint` | false | Python stubs get no `# noqa: PID001` on their `def` lines. Set it true for a tests repo that runs the RedHatQE flake8 PolarionIds plugin (`enable-extensions = PID`), which fails every test without `@pytest.mark.polarion("PROJ-<n>")`, stubs included; `/review-std` then runs `validate_std.py --polarion-lint` |
+| `pr_autofix` | false | `pipeline_runner.py review-loop` skips the team's PRs. When true, it addresses new review comments on a QualityFlow PR only once a person labels that PR `qf-autofix` |
 
 ### Review Rules Resolution
 

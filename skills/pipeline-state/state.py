@@ -67,7 +67,7 @@ MISSING_SUGGESTION = {
 # (collect/compile; never a test run). Anything but "passed" leaves the phase
 # completed but unverified, which the dashboard labels experimental.
 VERIFICATION = ("passed", "failed", "skipped")
-RUN_FIELDS = ("verification", "verification_reason")  # describe one run: cleared at its start
+RUN_FIELDS = ("verification", "verification_reason", "config_hash")  # describe one run: cleared at its start
 
 DISPLAY = {
     "stp": "STP Generation", "stp_review": "STP Review",
@@ -217,23 +217,27 @@ def feature_toggles():
 
 # ---------------------------------------------------------------- operations
 
+def new_state(ticket, project_id, display_name):
+    """A fresh state; also written by project-resolver when `--folder` comes first."""
+    now = now_iso()
+    return {
+        "version": 1,
+        "ticket_id": ticket,
+        "project_id": project_id,
+        "display_name": display_name,
+        "created": now,
+        "updated": now,
+        "phases": {ph: {"status": "pending", "error": None} for ph in PHASES},
+    }
+
+
 def op_init(args):
     p = state_path(args.ticket)
     if os.path.exists(p):
         # Read-or-init semantics (SKILL.md Operation 2): existing state wins.
         print(open(p).read(), end="")
         return
-    now = now_iso()
-    state = {
-        "version": 1,
-        "ticket_id": args.ticket,
-        "project_id": args.project_id,
-        "display_name": args.display_name,
-        "created": now,
-        "updated": now,
-        "phases": {ph: {"status": "pending", "error": None} for ph in PHASES},
-    }
-    atomic_write(p, state)
+    atomic_write(p, new_state(args.ticket, args.project_id, args.display_name))
     print("initialized %s" % p)
 
 
@@ -283,6 +287,12 @@ def op_complete(args):
             ph["output_checksum"] = checksum(args.output)
         else:
             warn("output file %s not found; checksum not recorded" % args.output)
+    # The repo config layers this run resolved (project-resolver writes the
+    # file only when a .qualityflow/ applied): a re-run after a repo config
+    # change shows a different hash.
+    resolved = os.path.join(outputs_dir(), args.ticket, "config.resolved.yaml")
+    if os.path.exists(resolved):
+        ph["config_hash"] = load_yaml(resolved).get("config_hash")
     ph.update(extra)
     save_state(args.ticket, state)
     print("%s: %s -> completed" % (args.ticket, args.phase))
@@ -560,6 +570,15 @@ def self_test():
         assert load_state(t2)["phases"]["codegen"]["verification"] == "skipped"
         main(["start-phase", t2, "codegen"])
         assert "verification" not in load_state(t2)["phases"]["codegen"]
+
+        # A phase records the hash of the repo config layers it ran with.
+        atomic_write("outputs/%s/config.resolved.yaml" % t2, {"config_hash": "sha256:abc"})
+        main(["complete-phase", t2, "codegen"])
+        assert load_state(t2)["phases"]["codegen"]["config_hash"] == "sha256:abc"
+        os.unlink("outputs/%s/config.resolved.yaml" % t2)
+        main(["start-phase", t2, "codegen"])
+        main(["complete-phase", t2, "codegen"])
+        assert "config_hash" not in load_state(t2)["phases"]["codegen"]
 
         # fail-phase records error, no completed timestamp
         main(["start-phase", t, "codegen"])

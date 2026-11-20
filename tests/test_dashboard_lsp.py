@@ -140,11 +140,14 @@ def test_bridge_preloads_only_for_typescript_and_fails_calls_in_two_minutes(tmp_
     monkeypatch.setattr(pipeline_runner.shutil, "which", lambda name: "/usr/bin/" + name)
     args = pipeline_runner._codex_lsp_args()
     assert "mcp_servers.lsp_ts.env.MCP_LSP_PRELOAD=\"1\"" in args
-    assert not any(a.startswith("mcp_servers.lsp_py.env.") for a in args)
+    assert not any(a.startswith("mcp_servers.lsp_py.env.MCP_LSP_PRELOAD") for a in args)
     assert "mcp_servers.lsp_py.tool_timeout_sec=120" in args
+    # Every bridge is read-only (no edit_file/rename_symbol).
+    assert "mcp_servers.lsp_py.env.MCP_LSP_READONLY=\"1\"" in args
     cfg_args = pipeline_runner._claude_lsp_args(tmp_path)
     cfg = json.loads(Path(cfg_args[0].split("=", 1)[1]).read_text())["mcpServers"]
-    assert cfg["lsp_ts"]["env"] == {"MCP_LSP_PRELOAD": "1"} and cfg["lsp_py"]["env"] == {}
+    assert cfg["lsp_ts"]["env"] == {"MCP_LSP_READONLY": "1", "MCP_LSP_PRELOAD": "1"}
+    assert cfg["lsp_py"]["env"] == {"MCP_LSP_READONLY": "1"}
 
 
 def test_lsp_calls_are_counted_from_the_stream():
@@ -180,6 +183,23 @@ def test_lsp_caveat_comes_from_the_counted_calls():
     assert caveats({"phases": {"stp": {"output": out, "lsp": {"ok": 4, "failed": 1}}}}) \
         == ["1 of 5 LSP calls failed"]
     assert caveats({"phases": {"stp": {"output": "done", "lsp": {"ok": 0, "failed": 2}}}}) \
+        == ["No LSP regression analysis"]
+
+
+def test_review_and_refine_runs_without_lsp_are_not_partial_analysis():
+    """Only the plan and test-writing runs get LSP. CNV-79308: a plan with 16 good
+    LSP calls showed "partial analysis" after Request changes, whose run said it
+    had no LSP (by design)."""
+    plan = {"output": "plan written", "lsp": {"ok": 16, "failed": 0}}
+    no_lsp = "LSP unavailable for this run; source searches were the fallback."
+    state = {"phases": {"stp": plan,
+                        "stp_refine": {"output": no_lsp, "lsp": {"ok": 0, "failed": 0}},
+                        "stp_review": {"output": no_lsp}}}
+    assert ui._detect_caveats(state) == []
+    # The plan and test-writing runs still warn.
+    assert ui._detect_caveats({"phases": {"stp": {"output": "LSP unavailable, text search used"}}}) \
+        == ["No LSP regression analysis"]
+    assert ui._detect_caveats({"phases": {"python_codegen": {"output": "x", "lsp": {"ok": 0, "failed": 0}}}}) \
         == ["No LSP regression analysis"]
 
 

@@ -83,6 +83,11 @@ refuses any other value. codegen completes whatever it says: anything but
 experimental. `start-phase` clears the previous run's `verification` and
 `verification_reason`.
 
+Any phase: when `outputs/{JIRA_ID}/config.resolved.yaml` exists (a repo's
+`.qualityflow/` config applied, see project-resolver), complete-phase copies its
+`config_hash` onto the phase, so a re-run after a repo config change shows a
+different hash. `start-phase` clears it too.
+
 ### 3b. Record Usage on a Phase
 
 **When:** A headless runner (e.g. `python3 pipeline_runner.py run {JIRA_ID} {phase}`)
@@ -140,6 +145,9 @@ project_id: "myproject"
 display_name: "My Project"
 created: "2026-03-30T07:00:00Z"
 updated: "2026-03-30T07:15:00Z"
+stp_folder: sig-network          # optional: the ticket's stps/ folder in the design-docs repo,
+                                 # written by project-resolver --folder or the dashboard; its
+                                 # .qualityflow/ applies to every step (project-resolver)
 
 phases:
   stp:

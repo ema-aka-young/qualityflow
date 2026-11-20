@@ -1,7 +1,7 @@
 ---
 name: stub-generator
 description: Generate test stubs with PSE docstrings from STD YAML — language and framework driven by project config
-model: claude-opus-4-6
+model: inherit
 ---
 
 # Stub Generator Skill
@@ -116,7 +116,7 @@ Log the count: `"Skipping {N} scenarios with existing coverage"`
 
 If `priority_filter` is provided:
 
-1. Remove scenarios where `priority != priority_filter` from working set
+1. Remove scenarios whose priority, phase tag aside (`P0 [TP]` is a P0), is not `priority_filter`
 2. Scenarios missing the `priority` field are included (backwards compatible)
 3. Log the filtering result:
 

@@ -34,7 +34,8 @@ from there (`gh repo fork --remote=false`, then push to the fork).
 | generated tests (`outputs/{JIRA_ID}/{lang}-tests/`) | `primary_repo` | each file's `target_path` from `summary.yaml`, else `tests/qualityflow/{JIRA_ID}/<file>` |
 
 - No `design_docs_repo`: the STP goes nowhere (it stays local); say so.
-- `<folder>`: `--folder`, else the folder of the existing PR (Step 2), else
+- `<folder>`: `--folder`, else `project_context.stp_folder` (the folder the
+  ticket's runs used), else the folder of the existing PR (Step 2), else
   the `stps/` subfolder whose name matches the STP's Owning SIG; with no
   match, list `gh api repos/{design_docs}/contents/stps --jq '.[]|select(.type=="dir").name'`
   and stop, asking for `--folder`.
@@ -71,3 +72,7 @@ The PR URL(s), opened or updated, and anything skipped with the reason.
 Next steps: ask reviewers on the PR (`gh pr edit {n} --add-reviewer ...`, or
 the dashboard's Ask for review), then fold their comments in with
 `/fix-pr {PR_URL}` — it edits the document on the PR and syncs the local copy.
+When the team's `pr_autofix` toggle is on, labelling the PR `qf-autofix` lets
+the scheduled `uv run pipeline_runner.py review-loop` fold new comments in
+instead (it reads this `pr_info.yaml`; every commit here starts with
+`QualityFlow:` so the loop knows the branch head is QualityFlow's).

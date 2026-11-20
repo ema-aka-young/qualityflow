@@ -41,7 +41,6 @@ import collections
 import concurrent.futures
 import contextlib
 import contextvars
-import fcntl
 import fnmatch
 import hashlib
 import hmac
@@ -71,7 +70,9 @@ import markdown
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+
+import qf_pr  # the PR helpers ui.py shares with pipeline_runner.py review-loop
 
 logger = logging.getLogger("qualityflow.dashboard")
 
@@ -88,7 +89,8 @@ class _RequestIDLogFilter(logging.Filter):
     """Stamps the current request's id (set by RequestIDMiddleware) onto every record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = _request_id_ctx.get()
+        # extra={"request_id": ...} wins: the middleware logs after its context is reset.
+        record.request_id = getattr(record, "request_id", None) or _request_id_ctx.get()
         return True
 
 
@@ -440,6 +442,7 @@ _RUNNER_ENMAAS_MODEL_DEFAULT = os.environ.get("QF_RUNNER_ENMAAS_MODEL", "rits/za
 _ENMAAS_MODEL_LABELS = {
     "rits/zai-org/glm-5-3": "GLM 5.3 (hosted, free)",
     "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash (hosted, free)",
+    "rits/meta-models/Muse-Spark-Open-816B-A42B-NVFP4": "Muse Spark (hosted, free)",
 }
 _RUNNER_ENMAAS_MODELS = [m.strip() for m in os.environ.get("QF_RUNNER_ENMAAS_MODELS", "").split(",") if m.strip()]
 if not _RUNNER_ENMAAS_MODELS:
@@ -578,18 +581,39 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response as StarletteResponse
 
 
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
 class RequestIDMiddleware(BaseHTTPMiddleware):
-    """Attach a unique request ID to every request for log correlation."""
+    """Attach a unique request ID to every request for log correlation. It is on
+    every log line the request writes, its audit records and its response
+    (X-Request-ID), and the dashboard shows it on errors, so one id traces an
+    action from the click to the logs."""
 
     async def dispatch(self, request: Request, call_next):
-        req_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        sent = request.headers.get("x-request-id") or ""
+        # A caller's own id is kept only when it is a plain token: it lands in the
+        # audit log and in error messages.
+        req_id = sent if _REQUEST_ID_RE.fullmatch(sent) else uuid.uuid4().hex[:12]
         request.state.request_id = req_id
         token = _request_id_ctx.set(req_id)
         try:
             response: StarletteResponse = await call_next(request)
+        except Exception:
+            # Without this the client gets a bare "Internal Server Error" and no id
+            # to match against the traceback logged here.
+            logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+            response = JSONResponse({"detail": "Internal server error", "request_id": req_id},
+                                    status_code=500)
         finally:
             _request_id_ctx.reset(token)
         response.headers["X-Request-ID"] = req_id
+        # Every failed action and every server error leaves a line carrying the id
+        # the person was shown (a refused write otherwise logs nothing). Failed
+        # reads are left out: the dashboard polls, and a 404 there is routine.
+        if response.status_code >= 500 or (response.status_code >= 400 and request.method not in ("GET", "HEAD")):
+            logger.warning("%s %s -> %d", request.method, request.url.path, response.status_code,
+                           extra={"request_id": req_id})
         _record_http_metric(request.method, response.status_code)
         return response
 
@@ -1044,6 +1068,8 @@ def _audit(action: str, actor: str, jira_id: str = "-", phase: str = "-", **fiel
     path = OUTPUTS / ".audit" / "audit.jsonl"
     row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "action": action,
            "jira_id": jira_id, "phase": phase, "actor": actor, **fields}
+    if _request_id_ctx.get():  # the id the person sees on an error, and every log line carries
+        row["request_id"] = _request_id_ctx.get()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _yaml_lock(path), open(path, "a") as f:  # append-only: no read-modify-write to lose
@@ -1703,32 +1729,7 @@ def metrics():
 # Helpers
 # ---------------------------------------------------------------------------
 
-class _TextTimestampLoader(yaml.SafeLoader):
-    """safe_load, except an unquoted timestamp stays the string it was written as.
-
-    State files are also written by agents, by hand: an import run wrote
-    `timestamp: 2026-10-08T05:45:33Z` to approvals.yaml, safe_load made it a
-    datetime, and sorting it against the dashboard's own ISO strings 500'd
-    /api/activity for every ticket (cnv2, 2026-10-08). Every reader here
-    expects strings."""
-
-
-_TextTimestampLoader.yaml_implicit_resolvers = {
-    first: [r for r in resolvers if r[0] != "tag:yaml.org,2002:timestamp"]
-    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()}
-
-
-def _read_yaml(path: Path) -> dict:
-    """Read a YAML file, return empty dict on failure.
-
-    Parseable-but-wrong-shaped YAML (a top-level list, a bare string) counts as
-    failure: every caller here indexes the result like a mapping, so returning
-    the list only moves the crash one line down."""
-    try:
-        data = yaml.load(path.read_text(), Loader=_TextTimestampLoader)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+_read_yaml = qf_pr.read_yaml
 
 
 def _read_state(path: Path) -> dict:
@@ -2168,7 +2169,19 @@ def get_pipeline(jira_id: str):
     # Include feature toggles so frontend can show skipped phases
     project_id = state.get("project_id") or state.get("project") or _infer_project(jira_id)
     toggles = _load_project_toggles(project_id)
+    # Repo config layers (.qualityflow/, config/README.md): resolve.py records what
+    # applied and which layer each overridden key came from; the effective toggles
+    # are in its merged copy of the project dir.
+    resolved = OUTPUTS / jira_id / "config.resolved.yaml"
+    if resolved.is_file():
+        cfg = _read_yaml(resolved) or {}
+        state["config_resolved"] = {k: cfg.get(k) for k in ("config_hash", "config_layers", "config_provenance")}
+        merged = OUTPUTS / jira_id / "config" / project_id / "project.yaml"
+        if project_id and merged.is_file():
+            toggles = {**toggles, **((_read_yaml(merged) or {}).get("feature_toggles") or {})}
     state["feature_toggles"] = toggles
+    # The STP folder control shows only where STPs live in a design-docs repo (#231).
+    state["docs_repo"] = _get_target_repo(project_id, "design_docs").get("full_name") if project_id else None
     # Gate overlay + gates list for the Approve card — on BOTH state sources
     # (idempotent re-run on the inferred path).
     gates = _get_approval_gates(project_id)
@@ -2630,7 +2643,11 @@ def _detect_caveats(state: dict) -> list[str]:
         phase = phases.get(name)
         if not isinstance(phase, dict):
             continue
-        lsp = phase.get("lsp")
+        # Only the plan and test-writing runs get the LSP bridges (pipeline_runner
+        # _LSP_PHASES). A review or refine run says it had no LSP by design; on
+        # CNV-79308 that put "partial analysis" on a plan with 16 good LSP calls.
+        lsp_phase = name == "stp" or name.endswith("codegen")
+        lsp = phase.get("lsp") if lsp_phase else None
         if isinstance(lsp, dict):
             # Counted from the run's own stream (pipeline_runner._lsp_calls).
             # The text check below fired on "refinement skipped" next to an
@@ -2646,7 +2663,7 @@ def _detect_caveats(state: dict) -> list[str]:
         low = text.lower()
         if "mcp auth failed" in low:
             _add("GitHub data incomplete")
-        if (not isinstance(lsp, dict) and "lsp" in low
+        if (lsp_phase and not isinstance(lsp, dict) and "lsp" in low
                 and any(w in low for w in ("skipped", "not set", "unavailable"))):
             _add("No LSP regression analysis")
         if "source_repo_path" in low and any(w in low for w in ("not set", "unset")):
@@ -3295,14 +3312,18 @@ def _member_states(project_id: str, member: str = "") -> list[tuple[str, dict]]:
     attempt of. Ticket-level on purpose: roi/engineering/quality-trend measure
     whole tickets, so a member's view is "the tickets I worked on", not a
     phase-sliced fragment of them. Blank member = the team view, unchanged."""
-    import qf_metrics
     states = _project_states(project_id)
     if not member:
         return states
-    return [(jid, s) for jid, s in states
-            if any(qf_metrics.actor_matches(a, member)
-                   for p in (s.get("phases") or {}).values() if isinstance(p, dict)
-                   for a in qf_metrics.phase_attempts(p))]
+    return [(jid, s) for jid, s in states if _ran_by(s, member)]
+
+
+def _ran_by(state: dict, member: str) -> bool:
+    """Did `member` run at least one phase attempt of this ticket?"""
+    import qf_metrics
+    return any(qf_metrics.actor_matches(a, member)
+               for p in ((state or {}).get("phases") or {}).values() if isinstance(p, dict)
+               for a in qf_metrics.phase_attempts(p))
 
 
 @app.get("/api/members")
@@ -3500,7 +3521,7 @@ def get_metrics_quality_trend(project: str = "", member: str = ""):
 
 
 @app.get("/api/metrics/drift")
-def get_metrics_drift(project: str = ""):
+def get_metrics_drift(project: str = "", member: str = ""):
     """Have the committed test files changed since codegen produced them?
     Recomputes the sha256 each generation_checksums entry recorded, against a
     local checkout of the target repo (SOURCE_REPO_PATH env), falling back to
@@ -3509,7 +3530,7 @@ def get_metrics_drift(project: str = ""):
     base = Path(os.environ.get("SOURCE_REPO_PATH") or ROOT)
     root_ok = base.is_dir()
     tickets = []
-    for jira_id, state in _project_states(project):
+    for jira_id, state in _member_states(project, member):
         checksums = state.get("generation_checksums")
         if not isinstance(checksums, dict) or not checksums:
             continue
@@ -4119,7 +4140,7 @@ _STALE_RUN_DAYS = 5  # matches ui/index.html's _isStaleAge amber threshold
 
 
 @app.get("/api/insights")
-def get_insights(project: str = ""):
+def get_insights(project: str = "", member: str = ""):
     """Actionable flags: bottleneck phases, cost anomalies, phases past their
     family's P90 duration, slow human reviews (>24h), failed phases, and runs
     stuck in_progress with no update in 5+ days. Sorted critical first; an
@@ -4127,13 +4148,17 @@ def get_insights(project: str = ""):
     that this endpoint is broken."""
     import qf_metrics
     global _metrics_cache
-    cache_key = f"insights:{project}"
+    cache_key = f"insights:{project}:{member}"
     now = time.time()
     cached = _metrics_cache.get(cache_key)
     if cached and now - cached[0] < _METRICS_CACHE_TTL:
         return cached[1]
 
-    states = _engineering_states(project)
+    # ?member= narrows what is flagged to that member's tickets; the medians
+    # and P90s a run is compared against stay the team's.
+    team = _engineering_states(project)
+    mine = {s["ticket_id"] for s in _engineering_states(project, member)} if member else None
+    states = [s for s in team if mine is None or s["ticket_id"] in mine]
     approvals_by_ticket = {s["ticket_id"]: _read_approvals(s["ticket_id"]) for s in states}
     insights = []
 
@@ -4150,7 +4175,9 @@ def get_insights(project: str = ""):
                                    else "Investigate this phase's typical run — no single driver stands out yet"),
         })
 
-    for a in qf_metrics.cost_anomalies(states):
+    for a in qf_metrics.cost_anomalies(team):
+        if mine is not None and a["jira_id"] not in mine:
+            continue
         detail = f"${a['cost_usd']} vs ${a['median_usd']} median ({a['ratio']}x)"
         if "retry_count" in a:
             detail += f"; {a['retry_count']} rerun(s) recorded on this phase"
@@ -4161,7 +4188,9 @@ def get_insights(project: str = ""):
             "recommended_action": "Check the run's output for why it needed more turns/tokens than usual.",
         })
 
-    for f in qf_metrics.slow_phases(states, _phase_timestamps):
+    for f in qf_metrics.slow_phases(team, _phase_timestamps):
+        if mine is not None and f["jira_id"] not in mine:
+            continue
         insights.append({
             "type": "slow_phase", "severity": "warn",
             "title": f"{f['jira_id']} {_PHASE_DISPLAY.get(f['family'], f['family'])} ran "
@@ -4324,11 +4353,13 @@ def get_metrics_usage():
 
 
 @app.get("/api/metrics/{project_id}")
-def get_metrics(project_id: str):
-    """Aggregated pipeline metrics for a project (or _all for cross-project)."""
+def get_metrics(project_id: str, member: str = ""):
+    """Aggregated pipeline metrics for a project (or _all for cross-project).
+    ?member= -> only the tickets that member ran a phase of (_member_states)."""
     global _metrics_cache
     now = time.time()
-    cached = _metrics_cache.get(project_id)
+    cache_key = f"{project_id}|member:{member}" if member else project_id
+    cached = _metrics_cache.get(cache_key)
     if cached and now - cached[0] < _METRICS_CACHE_TTL:
         return cached[1]
 
@@ -4349,6 +4380,8 @@ def get_metrics(project_id: str):
         # would file the ticket under a phantom project and zero out the real one.
         pid = (state or {}).get("project_id") or (state or {}).get("project") or _infer_project(jira_id)
         if not is_all and pid != project_id:
+            continue
+        if member and not _ran_by(state, member):
             continue
         if state:
             project_pipelines.setdefault(pid or "unknown", []).append(state)
@@ -4374,7 +4407,7 @@ def get_metrics(project_id: str):
                 "completion_pct": round(completed / total * 100) if total else 0,
             })
         result = {"projects": projects_summary}
-        _metrics_cache[project_id] = (now, result)
+        _metrics_cache[cache_key] = (now, result)
         return result
 
     # Single-project metrics
@@ -4449,8 +4482,9 @@ def get_metrics(project_id: str):
         "timeline": timeline,
         "value": _compute_value_metrics(project_id, states),
     }
-    _append_trend_snapshot(project_id, result["value"], total, completed)
-    _metrics_cache[project_id] = (now, result)
+    if not member:  # the daily trend history is the team's
+        _append_trend_snapshot(project_id, result["value"], total, completed)
+    _metrics_cache[cache_key] = (now, result)
     return result
 
 
@@ -4490,16 +4524,17 @@ def _get_peers() -> list[dict]:
     return peers
 
 
-def _local_rollup() -> dict:
-    """This instance's per-project summary + value metrics, for one cluster."""
+def _local_rollup(member: str = "") -> dict:
+    """This instance's per-project summary + value metrics, for one cluster.
+    ?member= -> only that member's tickets (get_metrics)."""
     cluster = os.environ.get("QF_CLUSTER_LABEL", "") or "local"
     projects = []
-    for p in get_metrics("_all").get("projects", []):
+    for p in get_metrics("_all", member).get("projects", []):
         pid = p["project_id"]
         proj_yaml = CONFIG / "projects" / pid / "project.yaml"
         display = _read_yaml(proj_yaml).get("display_name", pid.upper()) if proj_yaml.exists() else pid.upper()
         projects.append({**p, "display_name": display, "cluster": cluster, "url": "",
-                         "value": get_metrics(pid).get("value", {})})
+                         "value": get_metrics(pid, member).get("value", {})})
     return {"cluster": cluster, "projects": projects}
 
 
@@ -4521,11 +4556,12 @@ def _fetch_peer_rollup(peer: dict) -> dict:
 
 
 @app.get("/api/rollup")
-def rollup(local: bool = False):
+def rollup(local: bool = False, member: str = ""):
     """Org roll-up. On a team instance (or ?local=true) returns just this
-    cluster; on a manager instance (peers configured) merges all peers."""
-    mine = _local_rollup()
-    if local:
+    cluster; on a manager instance (peers configured) merges all peers.
+    ?member= is this cluster only: a member's runs are recorded where they ran."""
+    mine = _local_rollup(member)
+    if local or member:
         return mine
     peers = _get_peers()
     clusters = [mine]
@@ -5710,22 +5746,7 @@ def _write_yaml(path: Path, data, invalidate_cache: bool = True) -> None:
                        invalidate_cache=invalidate_cache)
 
 
-@contextlib.contextmanager
-def _yaml_lock(path: Path):
-    """Exclusive lock on a `.lock` sidecar next to `path`.
-
-    A sidecar rather than flock on the data file itself: the data file gets
-    replaced, so a lock held on it protects nothing. Shared by every writer of
-    the same file — including the raw-text writer in create_project — so YAML
-    and text writers of routing.yaml/project.yaml exclude each other.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(path.suffix + ".lock"), "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+_yaml_lock = qf_pr.file_lock  # one sidecar lock for the dashboard and the review loop
 
 
 def _atomic_yaml_update(path: Path, updater, invalidate_cache: bool = True):
@@ -5930,26 +5951,27 @@ def _refuse_if_downstream_built(jira_id: str, doc: str) -> None:
     The state file when there is one (a CLI run may be mid-flight); otherwise
     the detail route infers status from the artifact alone, which the
     deliverable check covers."""
-    downstream, refused = _REFINE_DOWNSTREAM[doc]
+    if _downstream_built(jira_id, doc):
+        raise HTTPException(409, _REFINE_DOWNSTREAM[doc][1])
+
+
+def _downstream_built(jira_id: str, doc: str) -> bool:
+    """Something was already built from `doc` (an STD from the STP, tests from
+    the STD), or is being built."""
+    downstream = _REFINE_DOWNSTREAM[doc][0]
     state_file = _state_dir(jira_id) / "pipeline_state.yaml"
     ds_status = ((_read_state(state_file)["phases"].get(downstream) or {}).get("status")
                  if state_file.exists() else None)
-    if (_phase_deliverable_exists(jira_id, downstream)
-            or ds_status in ("completed", "in_progress", "awaiting_approval")):
-        raise HTTPException(409, refused)
+    return bool(_phase_deliverable_exists(jira_id, downstream)
+                or ds_status in ("completed", "in_progress", "awaiting_approval"))
 
 
 def _drop_gate_decision(jira_id: str, doc: str) -> bool:
     """Drop the approve/reject decision on `doc` (stp|std) — both keys, as
     reset_pipeline does — once the document it was made on no longer exists in
     that form. True if there was one."""
-    approvals = _read_approvals(jira_id)
-    dropped = [k for k in {_GATE_APPROVAL_KEY[doc], doc} if k in approvals]
-    for k in dropped:
-        del approvals[k]
-    if dropped:
-        _write_approvals(jira_id, approvals)  # drops the state caches too
-    return bool(dropped)
+    return qf_pr.drop_gate_decision(_state_dir(jira_id) / "approvals.yaml", doc,
+                                    write=_atomic_write_text)  # drops the state caches too
 
 
 def _refresh_doc_review(phases: dict, jira_id: str, doc: str, ts: str) -> None:
@@ -6159,6 +6181,8 @@ def _run_phase_background(jira_id: str, phase: str, model: str = "",
             if not state:
                 state = {"jira_id": jira_id, "project": _infer_project(jira_id), "phases": {}}
             phase_data = {"status": "failed", "error": error_msg}
+            if _request_id_ctx.get():
+                phase_data["request_id"] = _request_id_ctx.get()
             if model:
                 phase_data["model"] = model
             phase_data["skill_version"] = _compute_skill_version()
@@ -6176,7 +6200,8 @@ def _run_phase_background(jira_id: str, phase: str, model: str = "",
             logger.exception("Could not persist failure for %s/%s", jira_id, phase)
 
         with _tasks_lock:
-            _running_tasks[key] = {"status": "failed", "_finished": time.time(), "error": error_msg}
+            _running_tasks[key] = {"status": "failed", "_finished": time.time(), "error": error_msg,
+                                   "request_id": _request_id_ctx.get()}
 
     finally:
         # Last resort: whatever happened above, the task must not stay "running".
@@ -6186,6 +6211,7 @@ def _run_phase_background(jira_id: str, phase: str, model: str = "",
                 _running_tasks[key] = {
                     "status": "failed", "_finished": time.time(),
                     "error": error_msg or f"Phase {phase} ended without a terminal status",
+                    "request_id": _request_id_ctx.get(),
                 }
 
 
@@ -6466,18 +6492,9 @@ async def run_pipeline_phase(jira_id: str, phase: str, request: Request, x_api_k
                                   datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
             # Notes other reviewers added since the last refine (Add note, Pull PR
             # comments) go into this run too, then the queue starts empty.
-            pending = _pending_notes_path(jira_id, parent)
-            queued = pending.read_text(errors="replace").strip() if pending.exists() else ""
-            if feedback:
-                queued += (("\n\n" if queued else "") +
-                           f"<!-- {actor} {datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n"
-                           f"{feedback}")
-            if queued:
-                notes.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write_text(notes, f"<!-- Reviewer notes from the dashboard -->\n{queued}\n")
-            else:
-                notes.unlink(missing_ok=True)
-            pending.unlink(missing_ok=True)
+            qf_pr.take_notes(_pending_notes_path(jira_id, parent), notes,
+                             qf_pr.note_block(actor, feedback) if feedback else "",
+                             write=_atomic_write_text)
         except OSError:
             logger.exception("Could not snapshot the document or save reviewer notes for %s/%s",
                              jira_id, phase)
@@ -6567,6 +6584,28 @@ def _live_progress(jira_id: str, phase: str) -> dict:
     return out
 
 
+@app.get("/api/pipelines/{jira_id}/runs/{phase}/log")
+def get_run_log(jira_id: str, phase: str, raw: bool = False):
+    """What the latest run of a step did (#223): a readable transcript of its
+    commands, tool calls, results and messages, or with raw=1 the stream itself.
+    The stream is rewritten on each run, so this is always the latest run.
+    Secrets are redacted again here: a running step's stream isn't yet."""
+    if phase not in _VALID_PHASES:
+        raise HTTPException(400, f"Unknown phase: {phase}. Valid: {_VALID_PHASES}")
+    if _safe_path_segment(jira_id) != jira_id:
+        raise HTTPException(400, "Invalid ticket id")
+    path = OUTPUTS / jira_id / ".runs" / f"{phase}.jsonl"
+    if not path.is_file():
+        raise HTTPException(404, f"No run log for {jira_id} {phase}: it has not run on this dashboard, "
+                                 "or ran before run logs were kept.")
+    from pipeline_runner import _redact_secrets, render_stream
+    stream = _redact_secrets(path.read_text(errors="replace"))
+    if raw:
+        return PlainTextResponse(stream, headers={
+            "Content-Disposition": f'inline; filename="{jira_id}-{phase}.jsonl"'})
+    return PlainTextResponse(f"# {jira_id} {phase}: the latest run's log\n\n" + render_stream(stream))
+
+
 @app.get("/api/pipelines/{jira_id}/run/{phase}/status")
 async def get_phase_run_status(jira_id: str, phase: str):
     """Poll for background phase execution status."""
@@ -6587,7 +6626,8 @@ async def get_phase_run_status(jira_id: str, phase: str):
     if task["status"] in ("completed", "blocked"):
         return {"status": task["status"], **task.get("result", {})}
     if task["status"] == "failed":
-        return {"status": "failed", "phase": phase, "jira_id": jira_id, "error": task.get("error", "Unknown error")}
+        return {"status": "failed", "phase": phase, "jira_id": jira_id, "error": task.get("error", "Unknown error"),
+                "request_id": task.get("request_id")}
     return {"status": "running", "phase": phase, "jira_id": jira_id,
             **_live_progress(jira_id, phase)}
 
@@ -6918,20 +6958,7 @@ def _get_target_repo(project_id: str, tier: str = "primary") -> dict:
     }
 
 
-def _github_api(method: str, url: str, token: str, data: dict | None = None) -> dict:
-    """Make a GitHub API request."""
-    body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, method=method, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        raise RuntimeError(f"GitHub API error ({e.code}): {error_body}")
+_github_api = qf_pr.github_api
 
 
 def _github_get_user(token: str) -> str:
@@ -7143,38 +7170,19 @@ def _collect_pr_files(jira_id: str) -> dict[str, list[dict]]:
     return groups
 
 
-def _git_blob_sha(content: str) -> str:
-    """The sha GitHub's contents API reports for a file with this content."""
-    data = content.encode()
-    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+_git_blob_sha = qf_pr.git_blob_sha
 
 
 def _pending_notes_path(jira_id: str, phase: str) -> Path:
-    """Reviewer notes queued for the next Request changes on `phase` (stp/std):
-    several people add theirs, and one refine applies them all."""
-    return OUTPUTS / jira_id / "reviews" / f"{jira_id}_{phase}_notes_pending.md"
+    return qf_pr.notes_path(OUTPUTS, jira_id, phase)
 
 
 def _append_pending_note(jira_id: str, phase: str, who: str, text: str) -> None:
-    path = _pending_notes_path(jira_id, phase)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    block = (f"<!-- {who} {datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n"
-             f"{text.strip()}\n")
-    with _yaml_lock(path):
-        prior = path.read_text(errors="replace") if path.exists() else ""
-        _atomic_write_text(path, prior + ("\n" if prior else "") + block)
-
-
-_NOTE_HEADER_RE = re.compile(r"^<!-- (.+?) (\d{4}-\d\d-\d\dT[^ ]+) -->$", re.M)
+    qf_pr.append_note(_pending_notes_path(jira_id, phase), who, text, write=_atomic_write_text)
 
 
 def _read_pending_notes(jira_id: str, phase: str) -> list[dict]:
-    path = _pending_notes_path(jira_id, phase)
-    text = path.read_text(errors="replace") if path.exists() else ""
-    heads = list(_NOTE_HEADER_RE.finditer(text))
-    return [{"who": h.group(1), "at": h.group(2),
-             "text": text[h.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)].strip()}
-            for i, h in enumerate(heads)]
+    return qf_pr.read_notes(_pending_notes_path(jira_id, phase))
 
 
 def _check_notes_phase(jira_id: str, phase: str) -> None:
@@ -7221,8 +7229,7 @@ def _pr_target(jira_id: str) -> tuple[str, int]:
     return repo, int(number)
 
 
-def _is_bot(login: str) -> bool:
-    return not login or login.endswith("[bot]")
+_is_bot = qf_pr.is_bot
 
 
 @app.post("/api/pipelines/{jira_id}/pull-pr-comments")
@@ -7240,20 +7247,8 @@ async def pull_pr_comments(jira_id: str, request: Request, x_api_key: str = Head
     repo, number = _pr_target(jira_id)
     token = str(body.get("github_token") or "").strip()
     since = (_read_pr_info(jira_id) or {}).get("comments_pulled_at") or ""
-    base = f"https://api.github.com/repos/{repo}"
-    found: list[tuple[str, str, str]] = []  # (created_at, login, text)
-    for path, kind in ((f"/pulls/{number}/comments", "line"), (f"/pulls/{number}/reviews", "review"),
-                       (f"/issues/{number}/comments", "comment")):
-        items = _github_api_get(base + path + "?per_page=100", token) or []
-        for c in items if isinstance(items, list) else []:
-            login = (c.get("user") or {}).get("login") or ""
-            text = (c.get("body") or "").strip()
-            when = c.get("created_at") or c.get("submitted_at") or ""
-            if _is_bot(login) or not text or when <= since:
-                continue
-            where = f" on {c['path']}:{c.get('line') or c.get('original_line') or ''}" if kind == "line" and c.get("path") else ""
-            found.append((when, login, f"{text}\n(from the PR{where}: {c.get('html_url', '')})"))
-    for when, login, text in sorted(found):
+    found = qf_pr.new_review_comments(lambda url: _github_api_get(url, token), repo, number, since)
+    for _, login, text in found:
         _append_pending_note(jira_id, "stp", f"@{login}", text)
     info = _read_pr_info(jira_id) or {}
     info["comments_pulled_at"] = max([since] + [w for w, _, _ in found])
@@ -7351,7 +7346,46 @@ def push_pr_folders(jira_id: str):
     folders = sorted(i["name"] for i in items
                      if i.get("type") == "dir" and i.get("name") != "stp-template")
     _stp_folder_cache[repo] = (folders, time.time())
-    return {"repo": repo, "folders": folders}
+    return {"repo": repo, "folders": folders, "folder": _ticket_stp_folder(jira_id)}
+
+
+def _ticket_stp_folder(jira_id: str) -> str | None:
+    """The ticket's stps/ folder: the one its runs use (pipeline state), else its PR's."""
+    state = _read_state(_state_dir(jira_id) / "pipeline_state.yaml") or {}
+    return state.get("stp_folder") or (_read_pr_info(jira_id) or {}).get("stp_folder") or None
+
+
+@app.post("/api/pipelines/{jira_id}/folder")
+async def set_stp_folder(jira_id: str, request: Request, x_api_key: str = Header(default="")):
+    """Set (or clear, with an empty stp_folder) the ticket's stps/<folder> in the
+    design-docs repo. Its .qualityflow/ applies to the ticket's next STP and STD
+    runs (#231): project-resolver reads it from pipeline state."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    if not re.match(r"^[A-Z]+-\d+$", jira_id):
+        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    folder = str(body.get("stp_folder") or "").strip()
+    if folder and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", folder):
+        raise HTTPException(400, "stp_folder is one stps/ subfolder name (letters, digits, . _ -)")
+    if not _get_target_repo(_infer_project(jira_id), "design_docs").get("full_name"):
+        raise HTTPException(400, "This project has no design-docs repo")
+    state_file = _state_dir(jira_id) / "pipeline_state.yaml"
+    if not state_file.exists():
+        raise HTTPException(404, f"No pipeline for {jira_id}")
+
+    def _set(data):
+        if folder:
+            data["stp_folder"] = folder
+        else:
+            data.pop("stp_folder", None)
+        return data
+
+    _atomic_yaml_update(state_file, _set)
+    return {"stp_folder": folder or None}
 
 
 @app.post("/api/pipelines/{jira_id}/push-pr")
@@ -7385,6 +7419,8 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
         body = {}
     if updating and not body.get("stp_folder") and existing.get("stp_folder"):
         body["stp_folder"] = existing["stp_folder"]
+    if not body.get("stp_folder"):  # the folder the ticket's runs used (#231)
+        body["stp_folder"] = _ticket_stp_folder(jira_id)
 
     project_id = _infer_project(jira_id)
     target = _get_target_repo(project_id, "primary")
@@ -7506,33 +7542,26 @@ async def push_to_pr(jira_id: str, request: Request, x_api_key: str = Header(def
                 ref = _github_api_get(f"https://api.github.com/repos/{push_repo}/git/ref/heads/"
                                       f"{urllib.parse.quote(branch_name, safe='')}", token)
                 head_sha = ((ref or {}).get("object") or {}).get("sha")
+            file_list = "\n".join(f"  - {f['path']}" for f in files)
+            commit_msg = (f"{qf_pr.COMMIT_PREFIX} {'update' if head_sha else 'test artifacts'} for {jira_id}\n\n"
+                          f"Files:\n{file_list}\n\nGenerated by QualityFlow pipeline.")
             if head_sha:
-                pushed = existing.get("pushed_blobs") or {}
-                for f in files:
-                    remote = _github_api_get(f"https://api.github.com/repos/{push_repo}/contents/"
-                                             f"{urllib.parse.quote(f['path'])}?ref={head_sha}", token) or {}
-                    if pushed.get(f["path"]) and remote.get("sha") and remote["sha"] != pushed[f["path"]]:
-                        raise HTTPException(409, f"{f['path']} was changed on the PR since QualityFlow pushed it. "
-                                                 "Pull PR comments or copy the change into the document first, "
-                                                 "so the push does not overwrite it.")
-                base_sha = head_sha
+                try:
+                    qf_pr.commit_on_branch(push_repo, branch_name, head_sha, files,
+                                           existing.get("pushed_blobs") or {}, commit_msg, token,
+                                           api=_github_api, get=_github_api_get)
+                except qf_pr.EditedOnPR as e:
+                    raise HTTPException(409, f"{e} was changed on the PR since QualityFlow pushed it. "
+                                             "Pull PR comments or copy the change into the document first, "
+                                             "so the push does not overwrite it.")
             else:
                 base_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/ref/heads/{base_branch}", token)
                 base_sha = base_info["object"]["sha"]
-            commit_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/commits/{base_sha}", token)
-            base_tree_sha = commit_info["tree"]["sha"]
-
-            # Create tree + commit on push_repo (fork or upstream)
-            tree_sha = _github_create_tree(push_repo, base_tree_sha, files, token)
-            file_list = "\n".join(f"  - {f['path']}" for f in files)
-            commit_msg = (f"QualityFlow: {'update' if head_sha else 'test artifacts'} for {jira_id}\n\n"
-                          f"Files:\n{file_list}\n\nGenerated by QualityFlow pipeline.")
-            commit_sha = _github_create_commit(push_repo, commit_msg, tree_sha, base_sha, token)
-
-            # Create/update branch on push_repo
-            if not head_sha:
+                commit_info = _github_api("GET", f"https://api.github.com/repos/{push_repo}/git/commits/{base_sha}", token)
+                tree_sha = _github_create_tree(push_repo, commit_info["tree"]["sha"], files, token)
+                commit_sha = _github_create_commit(push_repo, commit_msg, tree_sha, base_sha, token)
                 _github_create_branch(push_repo, branch_name, commit_sha, token)
-            _github_update_ref(push_repo, branch_name, commit_sha, token)
+                _github_update_ref(push_repo, branch_name, commit_sha, token)
 
             # Create PR on upstream — head is 'user:branch' for forks, 'branch' for same-repo
             push_user = push_repo.split("/")[0]
@@ -7638,21 +7667,8 @@ def _get_approval_gates(project_id: str) -> list[str]:
 
 
 def _read_approvals(jira_id: str) -> dict:
-    """Read approval state from state file.
-
-    Decisions sit at the top level (this module and `state.py approve` write
-    them there); a file written by hand from older docs nests them under
-    `approvals:`. Both count, the top level winning: reading only one shape
-    left a hand-written approval invisible here while the CLI gate passed,
-    and a dashboard approval invisible to the CLI."""
-    approvals_file = _state_dir(jira_id) / "approvals.yaml"
-    if not approvals_file.exists():
-        return {}
-    doc = _read_yaml(approvals_file)
-    wrapped = doc.get("approvals")
-    merged = dict(wrapped) if isinstance(wrapped, dict) else {}
-    merged.update({k: v for k, v in doc.items() if k != "approvals"})
-    return merged
+    """Read approval state from state file (both shapes: see qf_pr.read_approvals)."""
+    return qf_pr.read_approvals(_state_dir(jira_id) / "approvals.yaml")
 
 
 def _write_approvals(jira_id: str, approvals: dict) -> None:
@@ -7677,6 +7693,30 @@ def get_approvals(jira_id: str):
         "gates": gates,
         "approvals": approvals,
     }
+
+
+def _unapprove(jira_id: str, doc: str, reviewer: str, comment: str, cascade: bool) -> dict:
+    """Take back the decision on `doc` (stp|std) so it can be worked on again:
+    it goes back to awaiting approval, with Edit and Request changes. What was
+    already built from it (the STD from an STP, tests from an STD) would no
+    longer match, so it is archived like Reset Phase; the caller confirms that
+    with `cascade`."""
+    approvals = _read_approvals(jira_id)
+    if _GATE_APPROVAL_KEY.get(doc, doc) not in approvals and doc not in approvals:
+        raise HTTPException(409, f"The {doc.upper()} has no decision to take back")
+    reset: list[str] = []
+    if _downstream_built(jira_id, doc):
+        built = {"stp": "Test cases (STD) were", "std": "Tests were"}[doc]
+        if not cascade:
+            raise HTTPException(409, f"{built} built from this {doc.upper()}: un-approving it also "
+                                     "moves them to history. Confirm to continue.")
+        reset, _, _ = _reset_from(jira_id, _REFINE_DOWNSTREAM[doc][0])
+    _drop_gate_decision(jira_id, doc)
+    _audit("unapprove_phase", reviewer, jira_id=jira_id, phase=doc,
+           reset=",".join(reset) or "-", comment=comment or "-")
+    _slack_pipeline_event(jira_id, f"{doc.upper()} un-approved",
+                          f"Reviewer: {reviewer}" + (f" — {comment}" if comment else ""))
+    return {"status": "ok", "phase": doc, "unapproved": True, "reset": reset}
 
 
 @app.post("/api/pipelines/{jira_id}/approve/{phase}")
@@ -7706,8 +7746,10 @@ async def approve_phase(jira_id: str, phase: str, request: Request, x_api_key: s
     claimed_name = str(body.get("reviewer") or "").strip()[:120]
     comment = body.get("comment", "")
 
-    if action not in ("approve", "reject"):
-        raise HTTPException(400, f"Invalid action: {action}. Must be 'approve' or 'reject'")
+    if action not in ("approve", "reject", "unapprove"):
+        raise HTTPException(400, f"Invalid action: {action}. Must be 'approve', 'reject' or 'unapprove'")
+    if action == "unapprove":
+        return _unapprove(jira_id, phase, reviewer, comment, bool(body.get("cascade")))
 
     approvals = _read_approvals(jira_id)
     # Write under the CLI's canonical key (stp_review/std_review) — the one the
@@ -8078,15 +8120,9 @@ def _latest_previous(target: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime, default=None)
 
 
-@app.post("/api/pipelines/{jira_id}/reset/{from_phase}")
-def reset_pipeline(jira_id: str, from_phase: str, request: Request, x_api_key: str = Header(default="")):
-    """Reset a pipeline from a given phase — clears that phase and all downstream outputs."""
-    _check_rate_limit(request)
-    _check_api_key_or_origin(request, x_api_key)
-    if not re.match(r"^[A-Z]+-\d+$", jira_id):
-        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
-    if from_phase not in _PHASE_ORDER:
-        raise HTTPException(400, f"Unknown phase: {from_phase}. Valid: {', '.join(_PHASE_ORDER)}")
+def _reset_from(jira_id: str, from_phase: str) -> tuple[list[str], list[str], str]:
+    """Archive `from_phase` and everything after it to .previous-<ts>, drop their
+    approvals and reset their state. Returns (phases cleared, files archived, ts)."""
     with _ticket_maintenance(jira_id):
         start_idx = _PHASE_ORDER.index(from_phase)
         phases_to_clear = _PHASE_ORDER[start_idx:]
@@ -8136,16 +8172,28 @@ def reset_pipeline(jira_id: str, from_phase: str, request: Request, x_api_key: s
                 cleared.append(f"state/{jira_id}/pr_info.yaml")
 
         _invalidate_state_caches()  # archive/unlink bypasses _atomic_write_text
-        _audit("reset_phase", _resolve_actor(request, x_api_key), jira_id=jira_id, phase=from_phase,
-               phases_cleared=",".join(phases_to_clear), archived_to=f".previous-{reset_ts}")
+        return phases_to_clear, cleared, reset_ts
 
-        return {
-            "status": "reset",
-            "jira_id": jira_id,
-            "from_phase": from_phase,
-            "phases_cleared": phases_to_clear,
-            "files_cleared": cleared,
-        }
+
+@app.post("/api/pipelines/{jira_id}/reset/{from_phase}")
+def reset_pipeline(jira_id: str, from_phase: str, request: Request, x_api_key: str = Header(default="")):
+    """Reset a pipeline from a given phase — clears that phase and all downstream outputs."""
+    _check_rate_limit(request)
+    _check_api_key_or_origin(request, x_api_key)
+    if not re.match(r"^[A-Z]+-\d+$", jira_id):
+        raise HTTPException(400, f"Invalid Jira ID format: {jira_id}")
+    if from_phase not in _PHASE_ORDER:
+        raise HTTPException(400, f"Unknown phase: {from_phase}. Valid: {', '.join(_PHASE_ORDER)}")
+    phases_to_clear, cleared, reset_ts = _reset_from(jira_id, from_phase)
+    _audit("reset_phase", _resolve_actor(request, x_api_key), jira_id=jira_id, phase=from_phase,
+           phases_cleared=",".join(phases_to_clear), archived_to=f".previous-{reset_ts}")
+    return {
+        "status": "reset",
+        "jira_id": jira_id,
+        "from_phase": from_phase,
+        "phases_cleared": phases_to_clear,
+        "files_cleared": cleared,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -8448,7 +8496,17 @@ def _scan_python_test_file(text: str, filename: str, result: dict[str, list[dict
             i += 1
             continue
 
-        k = i + 1
+        # The docstring follows the signature, which can span lines
+        # (def test_x(\n    fixture: T,\n) -> None:) — walk to where its
+        # parentheses close first.
+        k, depth = i, 0
+        while k < n:
+            code = lines[k].split("#", 1)[0]
+            depth += code.count("(") - code.count(")")
+            if depth <= 0:
+                break
+            k += 1
+        k += 1
         while k < n and not lines[k].strip():
             k += 1
         if k < n and ('"""' in lines[k] or "'''" in lines[k]):

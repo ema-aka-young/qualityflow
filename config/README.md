@@ -14,8 +14,11 @@ invokes the **project-resolver** skill as Step 0:
 2. Look up the prefix in `routing.yaml` to find the project (e.g., `example`)
 3. Load `_defaults.yaml` (shared defaults for all projects)
 4. Load `projects/<project>/project.yaml` (project-specific overrides)
-5. Merge feature toggles (project values override defaults)
-6. Return `project_context` with `config_dir`, `feature_toggles`, and identity
+5. Merge the repo config layers (`.qualityflow/` directories in the repo
+   checkouts, see [Repo config layers](#repo-config-layers-qualityflow)) over
+   the project dir; with none, nothing changes
+6. Merge feature toggles (project values override defaults)
+7. Return `project_context` with `config_dir`, `feature_toggles`, and identity
 
 Agents then read only the config files they need from the resolved `config_dir`.
 
@@ -26,10 +29,13 @@ config/
   _schema.yaml                          # Validation rules for project configs
   _defaults.yaml                        # Shared defaults (all projects inherit)
   routing.yaml                          # Jira prefix -> project routing
+  layers.py                             # Repo config layers: discovery + trust boundary
+  merge.py                              # Deep merge of config layers
   projects/
     example/                            # Example project (copy for your own)
       project.yaml                      # Identity, toggles, scope boundaries
-      repositories.yaml                 # Repos, orgs, build system
+      repositories.yaml                 # Repos, orgs, build system, config_sources
+      .qualityflow.example/             # Starter .qualityflow/ for a team's repo
       components.yaml                   # Component -> package mappings
       jira.yaml                         # Jira instance config
       environment.yaml                  # Platform requirements
@@ -294,6 +300,164 @@ Analysis, repo-file fetching and generation use only that list. The pipeline
 runner restricts checkout environment variables and LSP bridges to the same
 list for this run, without changing the parent process environment.
 
+### Repo config layers (.qualityflow/)
+
+A team can keep QualityFlow config in its own repos, next to the tests and test
+plans it describes, and review it there. A `.qualityflow/` directory at the
+root of a configured repo's local checkout (the directory its `local_path_env`
+names) configures that repo; one in a child directory (`tests/.qualityflow/`,
+`tests/e2e/.qualityflow/`) configures the code under it. They are read
+automatically; there is no toggle. `config/layers.py` finds and checks them,
+`config/merge.py` merges them.
+
+```text
+<repo>/.qualityflow/
+  project.yaml                  # required: version: 1, project_id, then overrides
+  components.yaml  environment.yaml  coverage.yaml  review_rules.yaml
+  code_generation_config.yaml  tier*.yaml  patterns/*.yaml
+  repositories.yaml             # additional_repos only: context repos (below)
+  templates/**  reference/**    # copied whole
+  README.md                     # for the repo's readers; never loaded
+```
+
+`uv run onboard.py --scaffold-repo <checkout> --project-id <id>` writes a starter
+one (from `projects/example/.qualityflow.example/`).
+
+**Precedence**, highest first:
+
+| # | Layer |
+|---|-------|
+| 1 | `outputs/{JIRA_ID}/repositories.overlay.yaml` (which repos and checkouts; above) |
+| 2 | `.qualityflow/` in each ancestor of the target path, deepest first |
+| 3 | `.qualityflow/` at the root of the target's repo |
+| 4 | `.qualityflow/` at the root of the other repos, in `config_sources.order` |
+| 5 | `config/projects/<project>/` |
+| 6 | `config/_defaults.yaml` |
+
+The target is what the run works on: `/stp-builder` passes the design-docs
+repo's `stps/` tree, `/generate-tests` the STD's `target_test_directory` in the
+tests repo, `/fix-pr` the PR's changed documents (`resolve.py --target`).
+Without a target only the repo roots apply.
+
+**A ticket's `stps/` folder.** A design-docs repo can keep one layer per team
+or SIG, `stps/<folder>/.qualityflow/`, next to that team's STPs. For a project
+with a `design_docs_repo`, `resolve.py` finds the ticket's folder (first found:
+`/stp-builder --folder <name>`, the folder recorded in pipeline state as
+`stp_folder`, the imported STP's path, the ticket's PR, the `stps/` subfolder
+named after the STP's Owning SIG) and, when the caller passes no target or the
+`/stp-builder` one, targets `stps/<folder>`. So the folder's layer applies to
+the STP run and to every later step (STD, reviews, refines), which pass the
+Jira ID alone. It records the folder in pipeline state, prints
+`config: stps/<folder> (from <source>)`, and with no folder known says that no
+folder's layer applies. The dashboard shows the folder on the ticket, with a
+Set/Change control; Push to PR defaults to it. Changing it changes the next
+run's config (and its `config_hash`).
+
+**`config_sources`** in `repositories.yaml` (all optional; the example project
+shows the defaults):
+
+```yaml
+config_sources:
+  order: [primary_repo, tier2_repo, design_docs_repo, additional_repos]  # layer 4, highest first
+  nested: true            # false: repo roots only
+  exclude: []             # repos whose .qualityflow/ never applies (key, type or name)
+  allow_sensitive: []     # [pii_exceptions.yaml]: let a layer set PII exceptions
+  layer_repo_orgs: []     # orgs a layer may add context repos from, beyond the central repos' own
+  allow_ref_from_layers: false  # true: a layer's context repo may pin ref/branch
+```
+
+A repo without a local checkout contributes nothing.
+
+**Merge rules.** Mappings merge key by key, the higher layer winning; scalars
+replace; lists replace, except lists whose items are all mappings with an `id`
+(else all with a `name`), which merge item by item (a matching item
+deep-merges, a new one is appended). A list key can say
+`{merge: append, value: [...]}` or `{merge: replace, value: [...]}` instead.
+`null` removes the key, so it reads as unset. Each layer is checked before the
+merge and the merged config is validated like a project dir after it.
+
+**Nested layers join.** A layer in a child directory (`stps/sig-network/.qualityflow/`)
+supplements the layers below it: a list of plain values (strings, numbers, such
+as a tier's `reference_tests` or `stub_marks`) keeps their items and adds its
+own new ones, instead of replacing the list. Everything else merges as above:
+keyed lists by `id`/`name`, other lists of mappings replace, and a
+`{merge: replace, value: [...]}` directive still empties or replaces one list.
+The repo's root layer chooses for all its nested layers with `nested_layers`
+in its `project.yaml`: `join` (the default) or `override` (their lists replace,
+as between the other layers). A repo root over the central config always
+replaces. `config_layers` records each nested layer's mode as `lists`.
+
+**Trust boundary.** A checkout can be a fork or a PR branch, so a layer can
+change only what `_schema.yaml` `config_layers` lists:
+
+- **Identity marker.** `project.yaml` must hold `version: 1` and the
+  `project_id` the layer configures. A layer for another project is skipped
+  with a warning (`status: skipped_mismatch`); a layer without the marker is an
+  error.
+- **Files.** Only the files above. Anything else is an error, including
+  `jira.yaml` (its instance URL is where each person's Jira token goes),
+  `github.yaml` and `polarion-migration/`; `pii_exceptions.yaml` only with the
+  central `allow_sensitive` opt-in.
+- **Context repos.** A layer's `repositories.yaml` may hold `additional_repos`
+  and nothing else: `primary_repo` and `tier2_repo` (where generated tests
+  land), `design_docs_repo`, `repo_files`, `config_sources` and the rest stay
+  central, so a checked-in file never redirects a run. Each entry needs a
+  `name` and an `https` `url` on a `layer_repos.hosts` host, whose org one of
+  the central repos already uses or `config_sources.layer_repo_orgs` lists. It
+  may add `org`, `full_name` (both must match the url), `default_branch`,
+  `language`, `description` and a `local_path_env` named `*_REPO_PATH` that is
+  not another repo's checkout. No `local_path` or credentials; `ref`/`branch`
+  only with `allow_ref_from_layers: true`. Entries are appended by name, at any
+  depth: re-declaring a known repo is fine, naming a different repo the same is
+  an error. Provenance records each added repo
+  (`repositories.yaml:additional_repos.<name>`), and the ticket overlay applies
+  over them. The repo-aware steps open a context repo through its
+  `local_path_env` checkout like any other; the dashboard's checkout sync clones
+  only the central repos.
+- **Keys.** A layer's `project.yaml` may set `description`, `feature_toggles`, `versioning`,
+  `stp_document`, `scope_boundaries`, `scenario_tiers`, `stub_marks`,
+  `sig_mappings`, `decorator_mappings`, and (a repo-root layer only)
+  `nested_layers`; `display_name`, `review_sla`,
+  `model_policy`, `stakeholders` and anything else are errors. In the other
+  files a top-level key must be in the file's `_schema.yaml` spec or already in
+  the central file; a toggle must exist in `_defaults.yaml` or the central
+  `project.yaml`. A typo fails the run, naming the file and layer.
+  `pr_autofix` (the review loop pushing to PRs unattended) is central-only.
+- **Ratchet.** `pii_sanitization`, `repo_files_fetch`, `stp_review` and
+  `std_review` can be turned on by a layer, never off: a `false` over a central
+  `true` is ignored with a warning.
+- **Data only.** Symlinks inside a `.qualityflow/` are errors, and it must lie
+  inside its checkout; nothing in a layer is ever run.
+
+**What a run sees.** When a layer applies, `project_context.config_dir` is a
+merged copy at `outputs/{JIRA_ID}/config/<project>/`, so agents read the merged
+files where they always read config, and the context gains `config_layers`,
+`config_provenance` (which layer set each overridden key) and `config_hash`.
+`outputs/{JIRA_ID}/config.resolved.yaml` holds all of it, and pipeline-state's
+`complete-phase` records the hash on the phase, so a re-run after a repo config
+change shows a different hash. The dashboard's ticket view shows which layers
+applied and the layer each overridden setting came from, with any warnings.
+Without any `.qualityflow/`, `project_context` is exactly as before.
+
+**Auto-discovery** (no route, `config_dir: null`) reads the `.qualityflow/`
+layers in `SOURCE_REPO_PATH` too. With no central project to check against, the
+shallowest layer's `project_id` names the project and a layer declaring another
+is skipped. Only `project.yaml` applies, over the auto-discovery toggles with
+the same ratchet: `resolve.py` prints it as `repo_layer` with exit code 3, and
+the auto-discovery flow lays it over the context it synthesizes.
+
+**Checking a repo.** `uv run config/validate.py --repo <checkout>` checks every
+`.qualityflow/` in it the way a run loads it, against the central project its
+marker names (or the schema alone when this config has no such project), so a
+team can run it in its own CI with a QualityFlow checkout. It also warns when a
+tier file's `reference_tests` point into a repo that no `repositories.yaml`
+declares (central, the layer, or a layer above it): that checkout is never
+opened, so the reference is never read. Editors validate
+`.qualityflow/project.yaml` with `schemas/qualityflow.schema.json` (first line
+`# yaml-language-server: $schema=<raw URL of that file>`). Without a QualityFlow
+checkout, a team's CI can check that file against the same schema:
+`uvx check-jsonschema --schemafile <raw URL of the schema> .qualityflow/project.yaml`.
+
 ### repositories.yaml
 
 Repository locations for code analysis and test generation. `/add-repo
@@ -504,7 +668,9 @@ text. Omitted keys keep the skill's default.
 ## Feature Toggles Reference
 
 Feature toggles are defined in `_defaults.yaml` and can be overridden per
-project in `project.yaml`. Project values take precedence.
+project in `project.yaml`. Project values take precedence. A repo config layer
+can override them too, except that it can only turn `pii_sanitization`,
+`repo_files_fetch`, `stp_review` and `std_review` on, never off.
 
 | Toggle | Default | Effect |
 |--------|---------|--------|
@@ -521,6 +687,7 @@ project in `project.yaml`. Project values take precedence.
 | `pii_sanitization` | `true` | `true`: Run pii-sanitizer in document-formatter. `false`: Skip PII sanitization |
 | `repo_files_fetch` | `true` | `true`: project-resolver fetches the `repo_files` declared in `repositories.yaml` into `repo_rules`. `false`: Skip that step — `repo_rules` stays empty and the STP/STD reviewers fall back to generic default rules (lower review confidence) |
 | `polarion_lint` | `false` | `true`: Every Python stub's `def test_*` line ends with `# noqa: PID001`, and the STD review checks it (`validate_std.py --polarion-lint`). For a tests repo that runs the RedHatQE flake8 PolarionIds plugin (`enable-extensions = PID` in `.flake8`), which reports PID001 on any test without `@pytest.mark.polarion("PROJ-<n>")`, `__test__ = False` stubs included. `false`: No noqa |
+| `pr_autofix` | `false` | `true`: `uv run pipeline_runner.py review-loop` may act on this team's QualityFlow PRs, but only on a PR a person labelled `qf-autofix`: it queues the review comments its owner, members and collaborators left since the last pull as reviewer notes, runs `/refine-stp --address-findings`, commits the changed documents on the same PR branch (never a force push) and posts one summary comment. `false`: The loop skips the team's PRs; comments are handled by hand (Pull PR comments + Request changes on the dashboard, or `/fix-pr`) |
 
 ## Auto vs Tier Mode
 
@@ -664,10 +831,14 @@ uv run config/validate.py config/
 
 # Validate a single project
 uv run config/validate.py config/projects/example/
+
+# Validate a repo's .qualityflow/ directories
+uv run config/validate.py --repo ~/src/my-tests
 ```
 
 The validation script checks: required files exist, required YAML fields
-present, toggle-to-file consistency, and YAML syntax. It also runs as part
+present, toggle-to-file consistency, the `config_sources` block, and YAML
+syntax. It also runs as part
 of CI (`.github/workflows/validate.yml`).
 
 Add `--validate` to `deploy.py` to validate before deploying:
@@ -767,6 +938,8 @@ your host can reach.
   `std_review` only; `cheap`: collection and formatting subagents, when the
   runtime can pick a subagent's model (otherwise they inherit).
 - An explicit model (the dashboard picker, `--model`, or `QF_RUNNER_MODEL` /
-  `QF_RUNNER_CODEX_MODEL` / `QF_RUNNER_CURSOR_MODEL`) always wins.
+  `QF_RUNNER_CODEX_MODEL` / `QF_RUNNER_CURSOR_MODEL`) always wins. Skills never
+  pin a model in their frontmatter (`model: inherit`; CI rejects a model id
+  there): on the Claude runtime a skill's pin would override the chosen model.
 - `max_cost_usd` (default 5; `null` disables): a completed runner phase whose
   recorded cost is above it gets a warning in its output. It never stops a run.

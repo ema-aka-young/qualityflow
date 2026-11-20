@@ -28,9 +28,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
-from config.model_policy import default_model, load_policy
+import qf_pr
+from config.model_policy import default_model, feature_toggles, load_policy
 
 ROOT = Path(__file__).parent
 _CMD = {"stp": "stp-builder", "std": "std-builder", "codegen": "generate-tests",
@@ -237,6 +239,7 @@ MODEL_PRICES = {
     # Red Hat EnMaaS hosted open-weight models: no usage cost.
     "rits/zai-org/glm-5-3": (0.0, 0.0, 0.0, 0.0),
     "rits/deepseek-ai/deepseek-v4.1-flash-1017": (0.0, 0.0, 0.0, 0.0),
+    "rits/meta-models/muse-spark-open-816b-a42b-nvfp4": (0.0, 0.0, 0.0, 0.0),
     "claude-fable-5-1": (10.0, 0.25, 12.5, 50.0),
     "claude-fable-5": (10.0, 1.0, 12.5, 50.0),
     "claude-opus-5-5": (4.0, 0.2, 5.0, 20.0),
@@ -416,7 +419,10 @@ def _bridge_env(cmd):
     """The patched bridge (deploy/mcp-language-server.patch) opens workspace
     files only when asked: typescript-language-server needs them open, and for
     pyright and gopls opening them all is what hung the calls."""
-    return {"MCP_LSP_PRELOAD": "1"} if "typescript-language-server" in cmd else {}
+    # MCP_LSP_READONLY (same patch): no edit_file/rename_symbol, for clients
+    # that can't leave a server's tools out themselves (Cursor).
+    return {"MCP_LSP_READONLY": "1",
+            **({"MCP_LSP_PRELOAD": "1"} if "typescript-language-server" in cmd else {})}
 
 
 def _codex_lsp_args(env=None):
@@ -432,6 +438,38 @@ def _codex_lsp_args(env=None):
         for k, v in _bridge_env(cmd).items():
             args += ["-c", f'mcp_servers.{name}.env.{k}="{v}"']
     return args
+
+
+def _cursor_lsp_home(tmpdir, env=None):
+    """Cursor has no flag for extra MCP servers: it reads ~/.cursor/mcp.json
+    (plus the project's .cursor/mcp.json). So a Cursor run gets a HOME of its
+    own that links back to everything in the real one (caches, git and gh
+    config, Cursor's login and settings) except ~/.cursor/mcp.json, which is
+    the person's own servers plus the LSP bridges. Returns the env to add,
+    {} when there is no bridge (the run keeps the real HOME). Without this,
+    every Cursor run had no LSP and its STP said "partial analysis"."""
+    servers = _lsp_bridge_servers(env)
+    if not servers:
+        return {}
+    real, home = Path.home(), Path(tmpdir, "cursor-home")
+    (home / ".cursor").mkdir(parents=True)
+    for p in real.iterdir():
+        if p.name != ".cursor":
+            (home / p.name).symlink_to(p)
+    own = {}
+    if (real / ".cursor").is_dir():
+        for p in (real / ".cursor").iterdir():
+            if p.name != "mcp.json":
+                (home / ".cursor" / p.name).symlink_to(p)
+        try:
+            own = json.loads((real / ".cursor" / "mcp.json").read_text()).get("mcpServers") or {}
+        except (OSError, ValueError, AttributeError):
+            own = {}
+    own.update({n: {"command": "mcp-language-server", "args": cmd, "env": _bridge_env(cmd)}
+                for n, cmd in servers.items()})
+    (home / ".cursor" / "mcp.json").write_text(json.dumps({"mcpServers": own}))
+    # Cursor's own config and login stay where they were.
+    return {"HOME": str(home), "CURSOR_CONFIG_DIR": os.environ.get("CURSOR_CONFIG_DIR") or str(real / ".cursor")}
 
 
 def _claude_lsp_args(tmpdir, env=None):
@@ -450,14 +488,25 @@ def _claude_lsp_args(tmpdir, env=None):
         f"mcp__{n}__{t}" for n in servers for t in ("edit_file", "rename_symbol"))]
 
 
-def _codex_prompt(command, jira_id, flags=""):
+def _codex_prompt(command, jira_id, flags="", lsp_servers=()):
     """Adapt a QualityFlow slash-command workflow for Codex exec.
 
     QualityFlow's canonical command files are written for Claude Code and
     refer to Claude-only Skill/Task primitives. Codex can still use the same
     repo contract, but must read the referenced files directly and execute the
     instructions with its own shell/file/MCP tools.
+
+    lsp_servers names the run's LSP bridges. Models whose Codex catalog entry
+    defers MCP tools behind tool search (gpt-6.1-sol: supports_search_tool,
+    code_mode_only) don't see them up front; without their names a run once
+    declared "no lsp_* MCP tools are registered" and fell back to text search
+    with three bridges running (#211).
     """
+    bridges = (
+        "This run starts these LSP MCP servers: " + ", ".join(sorted(lsp_servers)) + ". If their "
+        "definition/references/hover tools are not in your tool list, find them with tool search "
+        "before deciding there are none. "
+        if lsp_servers else "")
     return (
         f"Run the QualityFlow phase `{command}` for Jira ticket `{jira_id}`"
         + (f" with the command arguments `{jira_id}{flags}` ($ARGUMENTS)" if flags else "") + ". "
@@ -472,6 +521,10 @@ def _codex_prompt(command, jira_id, flags=""):
         "`lsp_*` MCP servers' definition/references/hover tools instead (one per "
         "checked-out repo, named after its *_REPO_PATH variable); when there is "
         "none, follow the instructions' no-LSP fallback and say so. "
+        + bridges +
+        "Never change which commit a checkout is on (no checkout, switch, pull, reset or "
+        "stash in a *_REPO_PATH checkout): read the code as it is, and say so when what "
+        "you need is not there. "
         "Never print environment variable values: check a credential is set "
         "with `test -n`, not `env` or `echo` (the run's output is stored). "
         "Do not rewrite source code or invent a parallel "
@@ -489,6 +542,7 @@ _ENMAAS_DEFAULT_MODEL = "rits/zai-org/glm-5-3"
 ENMAAS_HOSTED = {
     "rits/zai-org/glm-5-3": ("GLM 5.3", 1_000_000),
     "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017": ("DeepSeek V4.1 Flash", 1_048_576),
+    "rits/meta-models/Muse-Spark-Open-816B-A42B-NVFP4": ("Muse Spark", 1_048_576),  # the gateway's max_model_len
 }
 
 
@@ -538,6 +592,58 @@ def default_runtime():
     QF_RUNNER_DEFAULT_RUNTIME if it names a runtime, else "codex"."""
     r = os.environ.get("QF_RUNNER_DEFAULT_RUNTIME", "").strip()
     return r if r in _RUNTIMES else "codex"
+
+
+def _git(path, *args):
+    # Popen, not subprocess.run: tests stub run() to stand in for the CLI, and the
+    # checkout guard is not part of the command they check.
+    proc = subprocess.Popen(["git", "-C", str(path), *args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+    try:
+        out, err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def _checkout_positions(env):
+    """{checkout: (commit, branch or "")} for every git checkout a *_REPO_PATH names."""
+    pos = {}
+    for var, path in sorted((env or {}).items()):
+        if var.endswith("_REPO_PATH") and path and Path(path).is_dir():
+            head = _git(path, "rev-parse", "HEAD")
+            if head.returncode == 0:
+                pos[path] = (head.stdout.strip(), _git(path, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip())
+    return pos
+
+
+def _restore_checkouts(before, restore=True):
+    """A run reads the team's checkouts; it must never move one (a CNV run once
+    did `git checkout main && git pull` in a product checkout to read a merged
+    PR). Every move becomes a warning, and the checkout goes back where it was,
+    keeping local changes, unless the dashboard manages it (QF_REPOS_DIR: its
+    sync resets clean checkouts every few minutes, so going back could undo that)."""
+    notes = []
+    for path, (commit, branch) in before.items():
+        now = _checkout_positions({"X_REPO_PATH": path}).get(path)
+        if not now or now == (commit, branch):
+            continue
+        what = f"the run moved the {path} checkout from {branch or commit[:9]} to {now[1] or now[0][:9]}"
+        if not restore:
+            notes.append(f"Warning: {what}.")
+            continue
+        if branch and now[1] == branch:
+            back = _git(path, "reset", "--keep", commit)            # same branch, moved (pull)
+        elif branch:
+            back = _git(path, "checkout", "-q", branch)
+            if back.returncode == 0 and _git(path, "rev-parse", "HEAD").stdout.strip() != commit:
+                back = _git(path, "reset", "--keep", commit)
+        else:
+            back = _git(path, "checkout", "-q", "--detach", commit)
+        notes.append(f"Warning: {what}; " + ("put it back." if back.returncode == 0
+                     else "could not put it back: " + (back.stderr.strip().splitlines() or ["?"])[-1]))
+    return notes
 
 
 def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
@@ -643,7 +749,8 @@ def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
                 argv += ["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"']
         if phase in _LSP_PHASES:
             argv += _codex_lsp_args(repo_env)
-        argv.append(_codex_prompt(cmd, jira_id, prompt[len(f"/{cmd} {jira_id}"):])
+        argv.append(_codex_prompt(cmd, jira_id, prompt[len(f"/{cmd} {jira_id}"):],
+                                  _lsp_bridge_servers(repo_env) if phase in _LSP_PHASES else ())
                     + model_instruction)
     else:
         # stream-json emits per-step events for the progress list; --verbose is
@@ -745,6 +852,8 @@ def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
                 raise ValueError("EnMaaS key required for an EnMaaS run — "
                                  "paste it in Settings (or set ENMAAS_KEY)")
             argv[-1:-1] = _enmaas_codex_args(tmpdir)  # options go before the prompt
+        if runtime == "cursor" and phase in _LSP_PHASES:
+            env.update(_cursor_lsp_home(tmpdir, repo_env))
         if runtime == "claude" and phase in _LSP_PHASES:
             argv += _claude_lsp_args(tmpdir, repo_env)
             # Cap every MCP call so a stuck one fails instead of stalling the run.
@@ -756,6 +865,8 @@ def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
             env["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc_path)
         stream_file = progress_path(jira_id, phase)
         stream_file.parent.mkdir(parents=True, exist_ok=True)
+        positions = _checkout_positions(env)
+        moved = []
         try:
             # stdout -> a file, not a pipe: the dashboard tails it while the
             # phase runs (see progress_path), and a timeout still leaves the
@@ -808,6 +919,9 @@ def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
                 f"(last steps: {where}; raise QF_RUNNER_TIMEOUT if the phase "
                 "legitimately needs longer)"))
         finally:
+            moved = _restore_checkouts(positions, restore=not os.environ.get("QF_REPOS_DIR"))
+            for note in moved:
+                print(note, file=sys.stderr)
             _LIVE_CODEX_SESSIONS.pop(f"{jira_id}/{phase}", None)
             _LIVE_CODEX_SESSIONS.pop(f"{jira_id}/{phase}#model", None)
             # The stream holds every command's output and stays on the PVC; a
@@ -850,6 +964,9 @@ def run_phase(model, jira_id, phase, creds=None, runtime=None, isolate=False,
         print(warning, file=sys.stderr)
         progress.append(warning)
         final_text += "\n" + warning
+    for note in moved:  # on the run's card and in its record (printed already)
+        progress.append(note)
+        final_text += "\n" + note
     # The success text is persisted too (pipeline_state.yaml "output").
     final_text = _redact_secrets(final_text)
     result = {"output": final_text, "verdict": _extract_verdict(final_text),
@@ -872,7 +989,8 @@ def _redact_file(path):
 
 def _lsp_calls(stdout):
     """{"ok": n, "failed": n} language-server calls in a run's stream: Codex's
-    mcp_tool_call items on the lsp_* bridge servers, Claude's LSP tool and
+    mcp_tool_call items on the lsp_* bridge servers, Cursor's completed
+    mcpToolCall on them, Claude's LSP tool and
     mcp__lsp_* calls (a tool_result with is_error counts as failed). The
     dashboard's "No LSP regression analysis" caveat is set from this, not from
     words in the summary."""
@@ -887,6 +1005,14 @@ def _lsp_calls(stdout):
         if (ev.get("type") == "item.completed" and item.get("type") == "mcp_tool_call"
                 and str(item.get("server", "")).startswith("lsp_")):
             if item.get("status") == "completed" and not item.get("error"):
+                ok += 1
+            else:
+                failed += 1
+        call = (ev.get("tool_call") or {}).get("mcpToolCall") if (
+            ev.get("type") == "tool_call" and ev.get("subtype") == "completed") else None
+        if isinstance(call, dict) and str((call.get("args") or {}).get("providerIdentifier", "")).startswith("lsp_"):
+            res = call.get("result") or {}
+            if isinstance(res.get("success"), dict) and not res["success"].get("isError"):
                 ok += 1
             else:
                 failed += 1
@@ -1022,6 +1148,98 @@ def _parse_stream(stdout):
             }
     return progress, (final or "Completed"), usage, model
 
+
+
+_LOG_CLIP = 2000  # characters of one command's output or tool result in a run log
+
+
+def _clip(text, limit=_LOG_CLIP):
+    text = text if isinstance(text, str) else json.dumps(text, default=str)
+    return text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} more characters)"
+
+
+def _block_text(content):
+    """A tool result's text: a string, or the text parts of a content list."""
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+    return content if isinstance(content, str) else json.dumps(content, default=str)
+
+
+def _tool_line(name, args):
+    args = args if isinstance(args, dict) else {}
+    if args.get("command"):
+        return f"$ {args['command']}" + (f"    # {args['description']}" if args.get("description") else "")
+    if args.get("file_path") or args.get("path"):
+        return f"[{name}] {args.get('file_path') or args.get('path')}"
+    return f"[{name}] {_clip(json.dumps(args, default=str), 400)}"
+
+
+def render_stream(raw):
+    """A run's stream (Claude Code stream-json, Cursor's, or Codex JSONL) as a
+    transcript a person can read: each command or tool call, its result clipped
+    to _LOG_CLIP, the model's messages and the final result. The dashboard's
+    run log link serves it (#223); lines it doesn't know are skipped."""
+    out = []
+    for line in (raw or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        t = ev.get("type")
+        item = ev.get("item") or {}
+        if t == "system" and ev.get("subtype") == "init":
+            out.append(f"== session started, model {ev.get('model', '?')}")
+        elif t == "thread.started":
+            out.append("== session started")
+        elif t == "assistant":
+            for b in (ev.get("message") or {}).get("content") or []:
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    out.append("> " + b["text"].strip().replace("\n", "\n> "))
+                elif b.get("type") == "tool_use":
+                    out.append(_tool_line(b.get("name", "tool"), b.get("input")))
+        elif t == "user":
+            for b in (ev.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    mark = "  [error] " if b.get("is_error") else "  "
+                    out.append(mark + _clip(_block_text(b.get("content"))).replace("\n", "\n  "))
+        elif t == "tool_call":  # Cursor
+            tc = ev.get("tool_call") or {}
+            key = next((k for k in tc if k.endswith("ToolCall")), None)
+            body = tc.get(key) or {} if key else {}
+            if ev.get("subtype") == "started":
+                name = (tc.get("function") or {}).get("name") or (key or "tool")[:-len("ToolCall")]
+                out.append(_tool_line(name, body.get("args") or (tc.get("function") or {}).get("arguments")))
+            elif ev.get("subtype") == "completed" and body.get("result") is not None:
+                out.append("  " + _clip(_block_text(body.get("result"))).replace("\n", "\n  "))
+        elif t == "item.completed":  # Codex
+            kind = item.get("type")
+            if kind == "command_execution":
+                out.append(f"$ {item.get('command', '')}")
+                if item.get("aggregated_output"):
+                    out.append("  " + _clip(item["aggregated_output"]).replace("\n", "\n  "))
+                if item.get("exit_code") not in (None, 0):
+                    out.append(f"  (exit {item['exit_code']})")
+            elif kind == "mcp_tool_call":
+                out.append(f"[{item.get('server', '?')}.{item.get('tool', '?')}] "
+                           + _clip(json.dumps(item.get("arguments"), default=str), 400)
+                           + f" -> {item.get('status', '?')}")
+                if item.get("result") is not None:
+                    out.append("  " + _clip(_block_text(item["result"])).replace("\n", "\n  "))
+                if item.get("error"):
+                    out.append(f"  [error] {_clip(_block_text(item['error']), 400)}")
+            elif kind == "agent_message" and item.get("text"):
+                out.append("> " + item["text"].strip().replace("\n", "\n> "))
+            elif kind == "file_change":
+                out.append("[file change] " + ", ".join(c.get("path", "?") for c in item.get("changes") or []))
+        elif t == "error" or t == "turn.failed":
+            out.append(f"[error] {_clip(_block_text(ev.get('message') or ev.get('error') or ev), 600)}")
+        elif t == "result":
+            out.append(f"== result: {ev.get('subtype', '')} after {ev.get('num_turns', '?')} turns")
+            if ev.get("result"):
+                out.append(_clip(_block_text(ev["result"]), 4000))
+    return "\n".join(out) + "\n"
 
 def _usage_extra(result):
     """The state fields worth persisting from a run_phase() result: usage +
@@ -1277,6 +1495,206 @@ def _run_ticket(key, label, phase, model, push, api_key, runtime=None):
     return True
 
 
+# PR review loop (`review-loop`): the dashboard's Pull PR comments -> Request
+# changes -> Push to PR, with nobody clicking. Dashboard-independent like
+# `watch`; it works on the outputs/ tree QualityFlow opened the PRs from
+# (outputs/<ticket>/state/pr_info.yaml), with the job's own credentials.
+_AUTOFIX_TOGGLE = "pr_autofix"
+_LOOP_MARKER = qf_pr.MARKER + "review-loop -->"
+# Whose comments may change a document with no person in between: the repo's
+# owner, its org's members and its collaborators (author_association). The
+# loop never reads anyone else's comment; it stays on the PR for a person.
+_TRUSTED = ("OWNER", "MEMBER", "COLLABORATOR")
+
+
+class _Skip(Exception):
+    """This PR is not one the loop may touch this pass; the message says why."""
+
+
+def _local_doc(key, path):
+    """Where a document on the PR lives in outputs/<key>/: the inverse of the
+    paths Push to PR writes (stps/<folder>/<key>.md in a design-docs repo,
+    docs/qualityflow/<key>/{stp,std,reviews}/... otherwise). None for
+    anything else, such as generated tests."""
+    out = _outputs_dir() / key
+    if re.fullmatch(r"stps/[^/]+/%s\.md" % re.escape(key), path):
+        return out / "stp" / ("%s_test_plan.md" % key)
+    m = re.fullmatch(r"docs/qualityflow/%s/(stp|std|reviews)/([^/]+)" % re.escape(key), path)
+    return out / m.group(1) / m.group(2) if m else None
+
+
+def _review_plan(key, info, label, token):
+    """What the loop would do for one recorded PR, or _Skip saying why not.
+    Local checks first, so a PR it may not touch costs no GitHub call."""
+    out = _outputs_dir() / key
+    if not feature_toggles(ROOT, key).get(_AUTOFIX_TOGGLE):
+        raise _Skip("%s is off for its project" % _AUTOFIX_TOGGLE)
+    if not (out / "stp" / ("%s_test_plan.md" % key)).exists():
+        raise _Skip("no STP in outputs/%s/stp/" % key)
+    # The dashboard's rule for Request changes (_refuse_if_downstream_built).
+    std_status = (((qf_pr.read_yaml(out / "state" / "pipeline_state.yaml").get("phases") or {})
+                   .get("std") or {}).get("status"))
+    if ((out / "std" / ("%s_test_description.yaml" % key)).exists()
+            or std_status in ("completed", "in_progress", "awaiting_approval")):
+        raise _Skip("an STD was already built from this STP; changing the STP would leave it "
+                    "out of date (reset from STD first, or address the comments by hand)")
+    pr = qf_pr.github_api("GET", "%s/repos/%s/pulls/%s" % (qf_pr.API, info["target_repo"], info["number"]), token)
+    if pr.get("state") != "open":
+        raise _Skip("the PR is %s" % ("merged" if pr.get("merged_at") else pr.get("state")))
+    if label not in [l.get("name") for l in pr.get("labels") or []]:
+        raise _Skip("no %s label on the PR" % label)
+    head = pr.get("head") or {}
+    head_repo = (head.get("repo") or {}).get("full_name")
+    if head.get("ref") != info["branch"] or not head_repo:
+        raise _Skip("the PR's branch is not %s" % info["branch"])
+    comments = qf_pr.new_review_comments(lambda url: qf_pr.github_api("GET", url, token),
+                                         info["target_repo"], info["number"],
+                                         info.get("comments_pulled_at") or "", _TRUSTED)
+    if not comments:
+        raise _Skip("no new review comments from the repo's owner, members or collaborators")
+    message = qf_pr.github_api("GET", "%s/repos/%s/git/commits/%s" % (qf_pr.API, head_repo, head["sha"]),
+                               token).get("message") or ""
+    if not message.startswith(qf_pr.COMMIT_PREFIX):
+        raise _Skip("the branch has a commit QualityFlow did not make (%s %r); not building over it"
+                    % (head["sha"][:7], message.splitlines()[0][:60] if message else ""))
+    return {"url": pr.get("html_url") or info.get("url"), "repo": head_repo,
+            "head": head["sha"], "comments": comments}
+
+
+def _pr_comment(info, token, text):
+    qf_pr.github_api("POST", "%s/repos/%s/issues/%s/comments" % (qf_pr.API, info["target_repo"], info["number"]),
+                     token, {"body": "%s\n%s" % (_LOOP_MARKER, text)})
+
+
+def _address(key, info, plan, model, runtime, token):
+    """Queue the comments as reviewer notes, refine the STP with them, commit
+    what changed on the PR's branch and say so on the PR. True when the PR is
+    up to date with them; False when a person has to step in."""
+    out = _outputs_dir()
+    comments = plan["comments"]
+    n, people = len(comments), ", ".join(sorted({login for _, login, _ in comments}))
+    pending = qf_pr.notes_path(out, key, "stp")
+    for _, login, text in comments:
+        qf_pr.append_note(pending, "@" + login, text)
+    # The watermark moves before the run: a comment is never pulled twice,
+    # even if the refine fails (its note then goes back on the queue).
+    info["comments_pulled_at"] = comments[-1][0]
+    info_file = out / key / "state" / "pr_info.yaml"
+    qf_pr.write_yaml(info_file, info)
+    queued = qf_pr.take_notes(pending, qf_pr.feedback_path(out, key, "stp"))
+    # /push-pr records pushed_blobs but not always files: either names what is on the PR.
+    docs = {p: _local_doc(key, p) for p in info.get("files") or info.get("pushed_blobs") or []}
+    docs = {p: f for p, f in docs.items() if f and f.exists()}
+    before = {p: f.read_text(errors="replace") for p, f in docs.items()}
+    stp = out / key / "stp" / ("%s_test_plan.md" % key)
+    stp_before = stp.read_text(errors="replace")
+    stale = ((qf_pr.read_yaml(out / key / "state" / "pipeline_state.yaml").get("phases") or {})
+             .get("stp") or {}).get("review_stale") is True
+    try:
+        # ponytail: runtime/rereview only when set, so run_phase stand-ins keep working.
+        result = run_phase(model, key, "stp_refine", **({"runtime": runtime} if runtime else {}),
+                           **({"rereview": True} if stale else {}))
+    except Exception as e:
+        qf_pr.requeue_notes(pending, queued)
+        _pr_comment(info, token, "QualityFlow could not address %d new review comment(s) (from %s): %s\n\n"
+                    "They stay queued as reviewer notes for the next refine." % (n, people, _redact_secrets(str(e))[:500]))
+        print("%s: refine failed: %s" % (key, _redact_secrets(str(e))), file=sys.stderr)
+        return False
+    persist_usage(key, "stp_refine", result)
+    cost = (result.get("usage") or {}).get("cost_usd")
+    ran = "/refine-stp %s --address-findings ran with them as reviewer notes: verdict %s (model %s%s)." % (
+        key, result.get("verdict") or "not reported", result.get("model") or "default",
+        ", $%.2f" % cost if isinstance(cost, (int, float)) else "")
+    # A refine invalidates the decision made on the old STP, as Request changes does.
+    reset = (stp.read_text(errors="replace") != stp_before
+             and qf_pr.drop_gate_decision(out / key / "state" / "approvals.yaml", "stp"))
+    changed = [{"path": p, "content": f.read_text(errors="replace")} for p, f in docs.items()
+               if f.read_text(errors="replace") != before[p]]
+    if not changed:
+        _pr_comment(info, token, "QualityFlow read %d new review comment(s) (from %s). %s\n"
+                    "The documents on this PR did not change, so nothing was pushed." % (n, people, ran))
+        print("%s: refined, nothing to push" % key)
+        return True
+    paths = [f["path"] for f in changed]
+    try:
+        sha = qf_pr.commit_on_branch(
+            plan["repo"], info["branch"], plan["head"], changed, info.get("pushed_blobs") or {},
+            "%s address review comments for %s\n\nFiles:\n%s\n\n%d review comment(s) (from %s) handed "
+            "to /refine-stp --address-findings as reviewer notes." % (qf_pr.COMMIT_PREFIX, key,
+                                                       "\n".join("  - " + p for p in paths), n, people),
+            token)
+    except (qf_pr.EditedOnPR, RuntimeError) as e:
+        why = ("%s was changed on the PR since QualityFlow pushed it" % e if isinstance(e, qf_pr.EditedOnPR)
+               else "GitHub refused the commit (the branch may have moved): %s" % _redact_secrets(str(e))[:300])
+        _pr_comment(info, token, "QualityFlow refined the STP for %d new review comment(s) (from %s) but did "
+                    "not push it: %s. The refined STP is in outputs/%s/ where the job ran." % (n, people, why, key))
+        print("%s: not pushed: %s" % (key, why), file=sys.stderr)
+        return False
+    info["pushed_blobs"] = {**(info.get("pushed_blobs") or {}),
+                            **{f["path"]: qf_pr.git_blob_sha(f["content"]) for f in changed}}
+    info["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    qf_pr.write_yaml(info_file, info)
+    _pr_comment(info, token, "QualityFlow took %d new review comment(s) (from %s). %s\n"
+                "Commit %s updates %s.%s\nA comment it did not apply is listed, with the reason, in "
+                "outputs/%s/reviews/%s_stp_refinement_log.md where the job ran."
+                % (n, people, ran, sha[:7], ", ".join(paths),
+                   " The STP's approval was reset: it needs a new one." if reset else "", key, key))
+    print("%s: pushed %s to %s" % (key, sha[:7], plan["url"]))
+    return True
+
+
+def review_loop(label, limit, model="", runtime=None, dry_run=False):
+    """One pass of the PR review loop. For each open PR QualityFlow opened
+    (recorded in outputs/<ticket>/state/pr_info.yaml, branch
+    qualityflow/<ticket>) whose project turned the pr_autofix toggle on and
+    that a person labelled `label`: queue the review comments people left
+    since the last pull as reviewer notes, run /refine-stp --address-findings
+    with them (the dashboard's Request changes), commit the documents that
+    changed on top of the PR's branch, and post one summary comment. Acts on
+    at most `limit` PRs. Never force-pushes, merges, closes or relabels.
+    Returns the number of PRs a person has to look at.
+
+    ponytail: like `watch`, nothing stops two overlapping passes (or a
+    Request changes on the dashboard) refining the same ticket at once;
+    schedule passes further apart than a refine takes."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+    if not token:
+        raise RuntimeError("the review loop needs GH_TOKEN (or GITHUB_TOKEN) in its environment")
+    acted = failed = 0
+    for info_file in sorted(_outputs_dir().glob("*/state/pr_info.yaml")):
+        if acted >= limit:
+            print("--max %d reached; the rest wait for the next pass" % limit)
+            break
+        key = info_file.parent.parent.name
+        info = qf_pr.read_yaml(info_file)
+        if not (info.get("target_repo") and info.get("number") and info.get("branch") == "qualityflow/" + key.lower()):
+            continue  # not a PR QualityFlow opened
+        try:
+            plan = _review_plan(key, info, label, token)
+        except _Skip as s:
+            print("%s: skip: %s" % (key, s))
+            continue
+        except Exception as e:
+            failed += 1
+            print("%s: %s" % (key, _redact_secrets(str(e))), file=sys.stderr)
+            continue
+        acted += 1
+        if dry_run:
+            print("%s: would address %d new review comment(s) on %s:" % (key, len(plan["comments"]), plan["url"]))
+            for when, login, text in plan["comments"]:
+                print("  %s %s: %s" % (when, login, text.splitlines()[0][:100]))
+            print("  then queue them as reviewer notes, run /refine-stp %s --address-findings, commit the "
+                  "changed documents on %s (no force) and comment on the PR" % (key, info["branch"]))
+            continue
+        os.environ.setdefault("QF_RUNNER", "cli")
+        try:
+            failed += not _address(key, info, plan, model, runtime, token)
+        except Exception as e:  # one PR's error never stops the rest of the pass
+            failed += 1
+            print("%s: %s" % (key, _redact_secrets(str(e))), file=sys.stderr)
+    return failed
+
+
 def main(argv):
     """CLI entrypoint.
 
@@ -1291,7 +1709,12 @@ def main(argv):
     Both read the dashboard key from QUALITYFLOW_API_KEY.
 
     `watch [--label L] [--max N] [--dry-run]` is one pass of the Jira label
-    trigger (see watch()); schedule it with cron, CI or a CronJob."""
+    trigger (see watch()); schedule it with cron, CI or a CronJob.
+
+    `review-loop [--label L] [--max N] [--dry-run]` is one pass of the PR
+    review loop (see review_loop()): new review comments on QualityFlow's PRs
+    that a team opted in (pr_autofix) and a person labelled (qf-autofix) are
+    addressed with /refine-stp and the same PR updated. Schedule it like watch."""
     import argparse
     ap = argparse.ArgumentParser(prog="pipeline_runner.py", description=main.__doc__)
     sub = ap.add_subparsers(dest="op", required=True)
@@ -1322,6 +1745,17 @@ def main(argv):
     w.add_argument("--push", metavar="URL", default=os.environ.get("QF_DASHBOARD_URL", ""),
                    help="also POST each ticket's outputs to this dashboard (optional)")
     w.add_argument("--dry-run", action="store_true", help="list the queued tickets; change nothing")
+    r = sub.add_parser("review-loop", help="one pass of the PR review loop: address new review comments "
+                       "on QualityFlow's labelled PRs and update them (schedule it with cron/CI)")
+    r.add_argument("--label", default=os.environ.get("QF_AUTOFIX_LABEL", "qf-autofix"),
+                   help="the PR label a person adds to opt that PR in (default: $QF_AUTOFIX_LABEL or qf-autofix)")
+    r.add_argument("--max", type=int, default=int(os.environ.get("QF_AUTOFIX_MAX", "2")),
+                   help="PRs acted on per pass (default: $QF_AUTOFIX_MAX or 2)")
+    r.add_argument("--model", default="", help="model override (default: inherit)")
+    r.add_argument("--runtime", choices=_RUNTIMES, default=None,
+                   help="CLI to run the refine with (default: $QF_RUNNER_DEFAULT_RUNTIME or codex)")
+    r.add_argument("--dry-run", action="store_true",
+                   help="print what each PR would get; no GitHub writes, no runs, no files changed")
     args = ap.parse_args(argv)
     api_key = os.environ.get("QUALITYFLOW_API_KEY", "")
 
@@ -1332,6 +1766,14 @@ def main(argv):
             failed = watch(args.label, args.max, model=args.model, push=args.push,
                            api_key=api_key, dry_run=args.dry_run, runtime=args.runtime)
         except Exception as e:  # urllib errors, missing env, bad config: one clear line
+            print("error: %s" % _redact_secrets(str(e)), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(1 if failed else 0)
+    if args.op == "review-loop":
+        try:
+            failed = review_loop(args.label, args.max, model=args.model, runtime=args.runtime,
+                                 dry_run=args.dry_run)
+        except Exception as e:
             print("error: %s" % _redact_secrets(str(e)), file=sys.stderr)
             sys.exit(1)
         sys.exit(1 if failed else 0)
